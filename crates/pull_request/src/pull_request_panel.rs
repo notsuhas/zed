@@ -989,6 +989,26 @@ impl PullRequestPanel {
         .detach();
     }
 
+    fn enable_auto_merge(&mut self, cx: &mut Context<Self>) {
+        let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
+            return;
+        };
+        let node_id = loaded.detail.info.id.node_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = provider
+                .enable_auto_merge(&node_id, MergeMethod::Squash)
+                .await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.detail_error = Some(error.to_string().into());
+                }
+                this.refresh_detail(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn toggle_draft(&mut self, cx: &mut Context<Self>) {
         let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
             return;
@@ -1552,6 +1572,15 @@ impl PullRequestPanel {
                                 .on_click(
                                     cx.listener(|this, _, _window, cx| this.toggle_draft(cx)),
                                 ),
+                            )
+                        })
+                        .when(is_open && !is_draft, |this| {
+                            this.child(
+                                Button::new("auto-merge", "Auto-merge")
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.enable_auto_merge(cx)
+                                    })),
                             )
                         }),
                 )

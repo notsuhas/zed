@@ -451,6 +451,16 @@ pub trait PullRequestProvider: Send + Sync {
         content: &'a str,
     ) -> ProviderFuture<'a, ()>;
 
+    /// Enable auto-merge with the given method.
+    fn enable_auto_merge<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        method: MergeMethod,
+    ) -> ProviderFuture<'a, ()>;
+
+    /// Disable auto-merge.
+    fn disable_auto_merge<'a>(&'a self, pull_request_node_id: &'a str) -> ProviderFuture<'a, ()>;
+
     /// Close a pull request.
     fn close_pull_request<'a>(&'a self, pull_request_node_id: &'a str) -> ProviderFuture<'a, ()>;
 

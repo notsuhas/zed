@@ -363,6 +363,26 @@ pub fn create_pull_request() -> String {
     )
 }
 
+pub fn enable_auto_merge() -> &'static str {
+    r#"
+    mutation EnableAutoMerge($pullRequestId: ID!, $method: PullRequestMergeMethod!) {
+      enablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId, mergeMethod: $method }) {
+        pullRequest { id }
+      }
+    }
+    "#
+}
+
+pub fn disable_auto_merge() -> &'static str {
+    r#"
+    mutation DisableAutoMerge($pullRequestId: ID!) {
+      disablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId }) {
+        pullRequest { id }
+      }
+    }
+    "#
+}
+
 pub fn close_pull_request() -> &'static str {
     r#"
     mutation ClosePullRequest($pullRequestId: ID!) {

@@ -1103,6 +1103,39 @@ impl PullRequestProvider for GitHubProvider {
         })
     }
 
+    fn enable_auto_merge<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        method: MergeMethod,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::enable_auto_merge(),
+                serde_json::json!({
+                    "pullRequestId": pull_request_node_id,
+                    "method": method.graphql(),
+                }),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn disable_auto_merge<'a>(&'a self, pull_request_node_id: &'a str) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::disable_auto_merge(),
+                serde_json::json!({ "pullRequestId": pull_request_node_id }),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
     fn close_pull_request<'a>(&'a self, pull_request_node_id: &'a str) -> ProviderFuture<'a, ()> {
         Box::pin(async move {
             let _: serde_json::Value = execute(
