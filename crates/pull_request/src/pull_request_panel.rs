@@ -13,12 +13,15 @@ use gpui::{
     App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Render,
     SharedString, Subscription, Task, WeakEntity, Window,
 };
+use crate::diff_position::thread_anchor;
 use crate::file_tree::build_tree_rows;
 use buffer_diff::BufferDiff;
-use editor::Editor;
+use editor::display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle};
+use editor::{Anchor, Editor};
 use http_client::HttpClient;
 use language::Buffer;
 use multi_buffer::MultiBuffer;
+use text::Point;
 use project::Project;
 use project::git_store::{GitStoreEvent, Repository};
 use settings::Settings as _;
@@ -504,6 +507,13 @@ impl PullRequestPanel {
         let head_ref = info.head_ref.to_string();
         let project = self.project.clone();
         let workspace = self.workspace.clone();
+        // Threads on this file, shown inline in the diff.
+        let file_threads: Vec<ReviewThread> = loaded
+            .threads
+            .iter()
+            .filter(|thread| thread.path == path)
+            .cloned()
+            .collect();
 
         // Is the PR's head branch the one checked out in the local repo? If so,
         // resolve its working directory so we can open the real file.
@@ -533,7 +543,16 @@ impl PullRequestPanel {
                         .await?;
                     workspace
                         .update_in(cx, |workspace, window, cx| {
-                            open_diff_item(buffer, base.as_ref(), false, &project, workspace, window, cx);
+                            open_diff_item(
+                                buffer,
+                                base.as_ref(),
+                                false,
+                                file_threads.clone(),
+                                &project,
+                                workspace,
+                                window,
+                                cx,
+                            );
                         })
                         .ok();
                     return anyhow::Ok(());
@@ -549,7 +568,16 @@ impl PullRequestPanel {
             workspace
                 .update_in(cx, |workspace, window, cx| {
                     let head_buffer = cx.new(|cx| Buffer::local(head.to_string(), cx));
-                    open_diff_item(head_buffer, base.as_ref(), true, &project, workspace, window, cx);
+                    open_diff_item(
+                        head_buffer,
+                        base.as_ref(),
+                        true,
+                        file_threads,
+                        &project,
+                        workspace,
+                        window,
+                        cx,
+                    );
                 })
                 .ok();
             anyhow::Ok(())
@@ -1288,10 +1316,12 @@ fn to_toggle(checked: bool) -> ToggleState {
 
 /// Build a base↔buffer diff editor and add it to the active pane. The buffer
 /// is the modified (right) side; `base_text` is the read-only original (left).
+#[allow(clippy::too_many_arguments)]
 fn open_diff_item(
     buffer: Entity<Buffer>,
     base_text: &str,
     read_only: bool,
+    threads: Vec<ReviewThread>,
     project: &Entity<Project>,
     workspace: &mut Workspace,
     window: &mut Window,
@@ -1321,7 +1351,70 @@ fn open_diff_item(
         }
         editor
     });
+    inject_thread_blocks(&editor, threads, cx);
     workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
+}
+
+/// Insert a read-only block under each thread's mapped line, showing its
+/// comments inline in the diff (the panel's thread list keeps the interactive
+/// reply/resolve actions).
+fn inject_thread_blocks(
+    editor: &Entity<Editor>,
+    threads: Vec<ReviewThread>,
+    cx: &mut Context<Workspace>,
+) {
+    editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let max_row = snapshot.max_point().row;
+        let mut blocks: Vec<BlockProperties<Anchor>> = Vec::new();
+        for thread in threads {
+            let Some(thread_anchor) = thread_anchor(&thread) else {
+                continue;
+            };
+            let row = thread_anchor.end_row;
+            if row > max_row {
+                continue;
+            }
+            let anchor = snapshot.anchor_before(Point::new(row, 0));
+            let count = thread.comments.len().max(1) as u32;
+            blocks.push(BlockProperties {
+                placement: BlockPlacement::Below(anchor),
+                height: Some((count * 2 + 1).min(24)),
+                style: BlockStyle::Flex,
+                render: Arc::new(move |cx| render_inline_thread(&thread, cx)),
+                priority: 0,
+            });
+        }
+        if !blocks.is_empty() {
+            editor.insert_blocks(blocks, None, cx);
+        }
+    });
+}
+
+fn render_inline_thread(thread: &ReviewThread, cx: &mut BlockContext) -> gpui::AnyElement {
+    let colors = cx.theme().colors().clone();
+    v_flex()
+        .w_full()
+        .gap_0p5()
+        .pl(cx.anchor_x)
+        .pr_2()
+        .py_1()
+        .border_t_1()
+        .border_color(colors.border)
+        .bg(colors.editor_background)
+        .when(thread.is_resolved, |this| {
+            this.child(
+                Label::new("resolved")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Success),
+            )
+        })
+        .children(thread.comments.iter().map(|comment| {
+            v_flex()
+                .child(Label::new(comment.author.login.clone()).size(LabelSize::XSmall))
+                .child(Label::new(comment.body.clone()).size(LabelSize::Small))
+        }))
+        .into_any_element()
 }
 
 /// Icon/color/label for an aggregate CI status.
