@@ -14,6 +14,7 @@ use gpui::{
     SharedString, Subscription, Task, WeakEntity, Window,
 };
 use crate::file_tree::build_tree_rows;
+use editor::Editor;
 use http_client::HttpClient;
 use project::Project;
 use project::git_store::{GitStoreEvent, Repository};
@@ -113,6 +114,8 @@ pub struct PullRequestPanel {
     detail_loading: bool,
     file_layout: FileLayout,
     collapsed_dirs: HashSet<String>,
+    comment_editor: Entity<Editor>,
+    reply_target: Option<SharedString>,
     _refresh_task: Option<Task<()>>,
     _detail_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -153,6 +156,12 @@ impl PullRequestPanel {
                 }
             });
 
+        let comment_editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(1, 6, window, cx);
+            editor.set_placeholder_text("Reply…", window, cx);
+            editor
+        });
+
         let mut this = Self {
             workspace: weak_workspace,
             project,
@@ -175,6 +184,8 @@ impl PullRequestPanel {
             detail_loading: false,
             file_layout: FileLayout::Tree,
             collapsed_dirs: HashSet::new(),
+            comment_editor,
+            reply_target: None,
             _refresh_task: None,
             _detail_task: None,
             _subscriptions: vec![subscription],
@@ -317,6 +328,112 @@ impl PullRequestPanel {
             self.collapsed_dirs.insert(dir_path);
         }
         cx.notify();
+    }
+
+    /// Re-fetch the selected PR's review threads (after a thread mutation).
+    fn refresh_threads(&mut self, cx: &mut Context<Self>) {
+        let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
+            return;
+        };
+        let id = loaded.detail.info.id.clone();
+        cx.spawn(async move |this, cx| {
+            let threads = provider
+                .fetch_review_threads(&id.owner, &id.repo, id.number)
+                .await;
+            this.update(cx, |this, cx| {
+                if let (Ok(threads), Some(loaded)) = (threads, this.selected.as_mut()) {
+                    loaded.threads = threads;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn start_reply(
+        &mut self,
+        thread_id: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reply_target = Some(thread_id);
+        let handle = self.comment_editor.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    fn submit_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.reply_target.clone() else {
+            return;
+        };
+        let body = self.comment_editor.read(cx).text(cx);
+        if body.trim().is_empty() {
+            return;
+        }
+        let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
+            return;
+        };
+        let new_comment = NewComment {
+            pull_request: loaded.detail.info.id.clone(),
+            body: body.into(),
+            target: CommentTarget::Reply {
+                in_reply_to: target,
+            },
+            review_id: None,
+            commit_sha: loaded.detail.info.head_sha.clone(),
+        };
+        self.comment_editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
+        self.reply_target = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = provider.add_comment(&new_comment).await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.detail_error = Some(error.to_string().into());
+                }
+                this.refresh_threads(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_thread_resolved(
+        &mut self,
+        thread_id: SharedString,
+        resolved: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(provider) = self.provider.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = if resolved {
+                provider.resolve_thread(&thread_id).await
+            } else {
+                provider.unresolve_thread(&thread_id).await
+            };
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(updated) => {
+                        if let Some(loaded) = this.selected.as_mut() {
+                            if let Some(thread) =
+                                loaded.threads.iter_mut().find(|t| t.id == updated.id)
+                            {
+                                *thread = updated;
+                            }
+                        }
+                    }
+                    Err(error) => this.detail_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Toggle a file's viewed state, optimistically updating then syncing.
@@ -517,7 +634,7 @@ impl PullRequestPanel {
                 .p_2()
                 .child(self.render_overview(loaded, cx))
                 .child(self.render_files(loaded, cx))
-                .child(self.render_threads(loaded))
+                .child(self.render_threads(loaded, cx))
                 .child(self.render_timeline(loaded))
                 .into_any_element()
         } else {
@@ -760,38 +877,153 @@ impl PullRequestPanel {
             )
     }
 
-    fn render_threads(&self, loaded: &LoadedPullRequest) -> impl IntoElement {
+    fn render_threads(&self, loaded: &LoadedPullRequest, cx: &Context<Self>) -> impl IntoElement {
         v_flex()
             .gap_1()
             .when(!loaded.threads.is_empty(), |this| {
                 this.child(Label::new("Review comments").size(LabelSize::Small))
             })
-            .children(loaded.threads.iter().map(|thread| {
-                v_flex()
-                    .gap_0p5()
-                    .p_1()
-                    .border_1()
-                    .border_color(gpui::transparent_black())
+            .children(
+                loaded
+                    .threads
+                    .iter()
+                    .map(|thread| self.render_thread(thread, cx)),
+            )
+    }
+
+    fn render_thread(&self, thread: &ReviewThread, cx: &Context<Self>) -> impl IntoElement {
+        let thread_id = thread.id.clone();
+        let location = format!(
+            "{}{}",
+            thread.path,
+            thread.line.map(|line| format!(":{line}")).unwrap_or_default()
+        );
+        let resolve_label = if thread.is_resolved {
+            "Unresolve"
+        } else {
+            "Resolve"
+        };
+        let resolved = thread.is_resolved;
+        let can_toggle = if resolved {
+            thread.viewer_can_unresolve
+        } else {
+            thread.viewer_can_resolve
+        };
+        let is_replying = self.reply_target.as_ref() == Some(&thread.id);
+
+        let header = h_flex()
+            .gap_2()
+            .justify_between()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Label::new(location).size(LabelSize::XSmall).color(Color::Muted))
+                    .when(thread.is_resolved, |this| {
+                        this.child(
+                            Label::new("resolved")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Success),
+                        )
+                    })
+                    .when(thread.is_outdated, |this| {
+                        this.child(
+                            Label::new("outdated")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
                     .child(
-                        Label::new(format!(
-                            "{}{}",
-                            thread.path,
-                            thread
-                                .line
-                                .map(|line| format!(":{line}"))
-                                .unwrap_or_default()
-                        ))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                        Button::new(SharedString::from(format!("reply:{thread_id}")), "Reply")
+                            .label_size(LabelSize::XSmall)
+                            .on_click(cx.listener({
+                                let thread_id = thread_id.clone();
+                                move |this, _, window, cx| {
+                                    this.start_reply(thread_id.clone(), window, cx)
+                                }
+                            })),
                     )
-                    .children(thread.comments.iter().map(|comment| {
-                        v_flex()
-                            .child(
-                                Label::new(comment.author.login.clone()).size(LabelSize::XSmall),
+                    .when(can_toggle, |this| {
+                        this.child(
+                            Button::new(
+                                SharedString::from(format!("resolve:{thread_id}")),
+                                resolve_label,
                             )
-                            .child(Label::new(comment.body.clone()).size(LabelSize::Small))
-                    }))
-            }))
+                            .label_size(LabelSize::XSmall)
+                            .on_click(cx.listener({
+                                let thread_id = thread_id.clone();
+                                move |this, _, _window, cx| {
+                                    this.set_thread_resolved(thread_id.clone(), !resolved, cx)
+                                }
+                            })),
+                        )
+                    }),
+            );
+
+        v_flex()
+            .gap_0p5()
+            .p_1()
+            .child(header)
+            .children(thread.comments.iter().map(render_comment))
+            .when(is_replying, |this| {
+                this.child(
+                    v_flex()
+                        .gap_1()
+                        .child(self.comment_editor.clone())
+                        .child(
+                            Button::new("submit-reply", "Comment")
+                                .label_size(LabelSize::XSmall)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.submit_reply(window, cx)
+                                })),
+                        ),
+                )
+            })
+    }
+}
+
+fn render_comment(comment: &ReviewComment) -> impl IntoElement {
+    let reactions = (!comment.reactions.is_empty()).then(|| {
+        h_flex().gap_1().children(
+            comment
+                .reactions
+                .iter()
+                .filter(|group| group.count > 0)
+                .map(|group| {
+                    Label::new(format!("{} {}", reaction_emoji(&group.content), group.count))
+                        .size(LabelSize::XSmall)
+                        .color(if group.viewer_has_reacted {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        })
+                }),
+        )
+    });
+
+    v_flex()
+        .gap_0p5()
+        .py_0p5()
+        .child(Label::new(comment.author.login.clone()).size(LabelSize::XSmall))
+        .child(Label::new(comment.body.clone()).size(LabelSize::Small))
+        .when_some(reactions, |this, reactions| this.child(reactions))
+}
+
+/// Map a GitHub reaction content enum to an emoji.
+fn reaction_emoji(content: &str) -> &'static str {
+    match content {
+        "THUMBS_UP" => "👍",
+        "THUMBS_DOWN" => "👎",
+        "LAUGH" => "😄",
+        "HOORAY" => "🎉",
+        "CONFUSED" => "😕",
+        "HEART" => "❤️",
+        "ROCKET" => "🚀",
+        "EYES" => "👀",
+        _ => "•",
     }
 }
 
