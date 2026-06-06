@@ -7,6 +7,20 @@
     "use_new_terminal": false,
   },
   {
+    "label": "build review_ui",
+    "command": "cargo",
+    "args": ["build", "-p", "review_ui"],
+    "allow_concurrent_runs": false,
+    "use_new_terminal": false,
+  },
+  {
+    "label": "Run",
+    "command": "cargo",
+    "args": ["run"],
+    "allow_concurrent_runs": false,
+    "use_new_terminal": false,
+  },
+  {
     "label": "cargo run --profile release-fast",
     "command": "cargo",
     "args": ["run", "--profile", "release-fast"],

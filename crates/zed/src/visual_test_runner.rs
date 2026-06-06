@@ -99,7 +99,7 @@ use {
     agent_servers::{AgentServer, AgentServerDelegate},
     anyhow::{Context as _, Result},
     assets::Assets,
-    editor::display_map::DisplayRow,
+    editor::{Editor, display_map::DisplayRow},
     feature_flags::FeatureFlagAppExt as _,
     git_ui::project_diff::ProjectDiff,
     gpui::{
@@ -109,6 +109,13 @@ use {
     image::RgbaImage,
     project::{AgentId, Project},
     project_panel::ProjectPanel,
+    review_ui::{
+        ReviewPanel,
+        test_support::{
+            VisualFileStatus, VisualInlineCommentDraft, VisualPullRequest, VisualPullRequestFile,
+            VisualReviewComment, VisualReviewPanelState,
+        },
+    },
     settings::{NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, Settings as _},
     settings_ui::SettingsWindow,
     std::{
@@ -209,6 +216,7 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         );
         language_models::init(app_state.user_store.clone(), app_state.client.clone(), cx);
         git_ui::init(cx);
+        review_ui::init(cx);
         project::AgentRegistryStore::init_global(
             cx,
             app_state.fs.clone(),
@@ -551,8 +559,25 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         }
     }
 
+    // Run Test 8: Review Panel visual tests
+    println!("\n--- Test 8: review_panel (4 variants) ---");
+    match run_review_panel_visual_tests(app_state.clone(), &mut cx, update_baseline) {
+        Ok(TestResult::Passed) => {
+            println!("✓ review_panel: PASSED");
+            passed += 1;
+        }
+        Ok(TestResult::BaselineUpdated(_)) => {
+            println!("✓ review_panel: Baselines updated");
+            updated += 1;
+        }
+        Err(e) => {
+            eprintln!("✗ review_panel: FAILED - {}", e);
+            failed += 1;
+        }
+    }
+
     // Run Test 8: ThreadItem icon decorations visual tests
-    println!("\n--- Test 8: thread_item_icon_decorations ---");
+    println!("\n--- Test 9: thread_item_icon_decorations ---");
     match run_thread_item_icon_decorations_visual_tests(app_state.clone(), &mut cx, update_baseline)
     {
         Ok(TestResult::Passed) => {
@@ -2819,6 +2844,256 @@ fn run_multi_workspace_sidebar_visual_tests(
     }
 
     Ok(test_result)
+}
+
+#[cfg(target_os = "macos")]
+fn run_review_panel_visual_tests(
+    app_state: Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Result<TestResult> {
+    let temp_dir = tempfile::tempdir()?;
+    let temp_path = temp_dir.keep();
+    let canonical_temp = temp_path.canonicalize()?;
+    let project_path = canonical_temp.join("project");
+    let src_dir = project_path.join("src");
+    std::fs::create_dir_all(&src_dir)?;
+    std::fs::write(
+        src_dir.join("review_panel.rs"),
+        r#"pub fn render_review_panel() {
+    let comments = load_comments();
+    for comment in comments {
+        render_comment(comment);
+    }
+}
+
+fn load_comments() -> Vec<String> {
+    vec!["looks good".to_string()]
+}
+"#,
+    )?;
+    std::fs::create_dir_all(project_path.join("crates/review_ui/src"))?;
+    std::fs::write(
+        project_path.join("crates/review_ui/src/comment_card.rs"),
+        "pub fn render_comment_card() {}\n",
+    )?;
+
+    let bounds = Bounds {
+        origin: point(px(0.0), px(0.0)),
+        size: size(px(900.0), px(540.0)),
+    };
+    let project = cx.update(|cx| {
+        Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+
+    let workspace_window: WindowHandle<Workspace> = cx
+        .update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    cx.new(|cx| {
+                        Workspace::new(None, project.clone(), app_state.clone(), window, cx)
+                    })
+                },
+            )
+        })
+        .context("Failed to open review panel visual test window")?;
+
+    cx.run_until_parked();
+
+    let add_worktree_task = workspace_window
+        .update(cx, |workspace, _window, cx| {
+            let project = workspace.project().clone();
+            project.update(cx, |project, cx| {
+                project.find_or_create_worktree(&project_path, true, cx)
+            })
+        })
+        .context("Failed to start adding review panel visual test worktree")?;
+    cx.background_executor.allow_parking();
+    cx.foreground_executor
+        .block_test(add_worktree_task)
+        .context("Failed to add review panel visual test worktree")?;
+    cx.background_executor.forbid_parking();
+    cx.run_until_parked();
+
+    let open_file_task = workspace_window
+        .update(cx, |workspace, window, cx| {
+            let worktree_id = workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .map(|worktree| worktree.read(cx).id());
+            worktree_id.map(|worktree_id| {
+                let rel_path: Arc<util::rel_path::RelPath> =
+                    util::rel_path::rel_path("src/review_panel.rs").into();
+                let project_path: project::ProjectPath = (worktree_id, rel_path).into();
+                workspace.open_path(project_path, None, true, window, cx)
+            })
+        })
+        .log_err()
+        .flatten();
+    if let Some(task) = open_file_task {
+        cx.background_executor.allow_parking();
+        cx.foreground_executor.block_test(task).log_err();
+        cx.background_executor.forbid_parking();
+    }
+    cx.run_until_parked();
+
+    let (review_panel, active_editor) = workspace_window
+        .update(cx, |workspace, window, cx| {
+            let workspace_entity = cx.entity();
+            let review_panel =
+                cx.new(|cx| ReviewPanel::new(workspace, workspace_entity.downgrade(), window, cx));
+            workspace.add_panel(review_panel.clone(), window, cx);
+            workspace.open_panel::<ReviewPanel>(window, cx);
+            let active_editor = workspace
+                .active_item(cx)
+                .and_then(|item| item.act_as::<Editor>(cx));
+            (review_panel, active_editor)
+        })
+        .context("Failed to add review panel")?;
+
+    let mut results = Vec::new();
+    for (name, state) in [
+        (
+            "review_panel_inline_comments_expanded",
+            review_panel_visual_state(None, Vec::new()),
+        ),
+        (
+            "review_panel_inline_comments_collapsed",
+            review_panel_visual_state(None, vec![1001]),
+        ),
+        (
+            "review_panel_reply_composer",
+            review_panel_visual_state(
+                Some(VisualInlineCommentDraft::Reply {
+                    comment_id: 1001,
+                    body: "Thanks, I tightened this up and added a test.".into(),
+                }),
+                Vec::new(),
+            ),
+        ),
+        (
+            "review_panel_new_comment_composer",
+            review_panel_visual_state(
+                Some(VisualInlineCommentDraft::NewThread {
+                    path: "src/review_panel.rs".into(),
+                    line: 5,
+                    body: "Can we cover the empty comment state too?".into(),
+                }),
+                Vec::new(),
+            ),
+        ),
+    ] {
+        workspace_window.update(cx, |_workspace, window, cx| {
+            review_panel.update(cx, |panel, cx| {
+                panel.set_visual_test_state(state, active_editor.clone(), window, cx);
+            });
+        })?;
+        cx.run_until_parked();
+        results.push(run_visual_test(
+            name,
+            workspace_window.into(),
+            cx,
+            update_baseline,
+        )?);
+    }
+
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            let project = workspace.project().clone();
+            project.update(cx, |project, cx| {
+                let worktree_ids: Vec<_> =
+                    project.worktrees(cx).map(|wt| wt.read(cx).id()).collect();
+                for id in worktree_ids {
+                    project.remove_worktree(id, cx);
+                }
+            });
+            window.remove_window();
+        })
+        .log_err();
+    cx.run_until_parked();
+
+    if let Some(updated) = results.iter().find_map(|result| match result {
+        TestResult::BaselineUpdated(path) => Some(path.clone()),
+        TestResult::Passed => None,
+    }) {
+        Ok(TestResult::BaselineUpdated(updated))
+    } else {
+        Ok(TestResult::Passed)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn review_panel_visual_state(
+    draft: Option<VisualInlineCommentDraft>,
+    collapsed_threads: Vec<u64>,
+) -> VisualReviewPanelState {
+    VisualReviewPanelState {
+        pull_request: VisualPullRequest {
+            number: 4287,
+            title: "Complete GitHub review panel interactions".into(),
+            author: "octocat".into(),
+            base_ref: "main".into(),
+            head_ref: "feature/review_panel".into(),
+            head_sha: "abc1234".into(),
+        },
+        files: vec![
+            VisualPullRequestFile {
+                path: "src/review_panel.rs".into(),
+                status: VisualFileStatus::Modified,
+                additions: 42,
+                deletions: 8,
+            },
+            VisualPullRequestFile {
+                path: "crates/review_ui/src/comment_card.rs".into(),
+                status: VisualFileStatus::Added,
+                additions: 18,
+                deletions: 0,
+            },
+        ],
+        comments: vec![
+            VisualReviewComment {
+                id: 1001,
+                author: "reviewer".into(),
+                body: "This is much easier to scan inline. Can we make sure the collapse control stays pinned to the top?".into(),
+                created_at: "2026-04-26T17:10:00Z".into(),
+                path: "src/review_panel.rs".into(),
+                line: 3,
+                reply_to: None,
+            },
+            VisualReviewComment {
+                id: 1002,
+                author: "author".into(),
+                body: "Good call. I switched it to a chevron and kept it top-aligned.".into(),
+                created_at: "2026-04-26T17:16:00Z".into(),
+                path: "src/review_panel.rs".into(),
+                line: 3,
+                reply_to: Some(1001),
+            },
+        ],
+        tree_view: true,
+        collapsed_threads,
+        draft,
+    }
 }
 
 #[cfg(target_os = "macos")]
