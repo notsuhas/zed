@@ -6,6 +6,7 @@
 //! - `pull_request_panel` — the dock panel and its sub-views.
 
 mod diff_position;
+mod file_tree;
 mod github_graphql;
 mod github_provider;
 mod github_queries;

@@ -13,10 +13,12 @@ use gpui::{
     App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Render,
     SharedString, Subscription, Task, WeakEntity, Window,
 };
+use crate::file_tree::build_tree_rows;
 use http_client::HttpClient;
 use project::Project;
 use project::git_store::{GitStoreEvent, Repository};
 use settings::Settings as _;
+use std::collections::HashSet;
 use std::sync::Arc;
 use ui::{
     Button, ButtonStyle, Checkbox, Color, Icon, IconButton, IconName, IconSize, Label, LabelSize,
@@ -79,6 +81,7 @@ struct LoadedPullRequest {
     detail: PullRequest,
     files: Vec<PullRequestFile>,
     threads: Vec<ReviewThread>,
+    timeline: Vec<TimelineItem>,
 }
 
 enum ActiveView {
@@ -109,6 +112,7 @@ pub struct PullRequestPanel {
     detail_error: Option<SharedString>,
     detail_loading: bool,
     file_layout: FileLayout,
+    collapsed_dirs: HashSet<String>,
     _refresh_task: Option<Task<()>>,
     _detail_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -170,6 +174,7 @@ impl PullRequestPanel {
             detail_error: None,
             detail_loading: false,
             file_layout: FileLayout::Tree,
+            collapsed_dirs: HashSet::new(),
             _refresh_task: None,
             _detail_task: None,
             _subscriptions: vec![subscription],
@@ -269,6 +274,11 @@ impl PullRequestPanel {
             let detail = provider.fetch_pull_request(&owner, &repo, number).await;
             let files = provider.fetch_files(&owner, &repo, number).await;
             let threads = provider.fetch_review_threads(&owner, &repo, number).await;
+            // Timeline is non-critical; an error here shouldn't block the view.
+            let timeline = provider
+                .fetch_timeline(&owner, &repo, number)
+                .await
+                .unwrap_or_default();
             this.update(cx, |this, cx| {
                 this.detail_loading = false;
                 match (detail, files, threads) {
@@ -277,6 +287,7 @@ impl PullRequestPanel {
                             detail,
                             files,
                             threads,
+                            timeline,
                         });
                     }
                     (detail, files, threads) => {
@@ -298,6 +309,13 @@ impl PullRequestPanel {
     fn back_to_list(&mut self, cx: &mut Context<Self>) {
         self.active_view = ActiveView::List;
         self.selected = None;
+        cx.notify();
+    }
+
+    fn toggle_dir(&mut self, dir_path: String, cx: &mut Context<Self>) {
+        if !self.collapsed_dirs.remove(&dir_path) {
+            self.collapsed_dirs.insert(dir_path);
+        }
         cx.notify();
     }
 
@@ -500,6 +518,7 @@ impl PullRequestPanel {
                 .child(self.render_overview(loaded, cx))
                 .child(self.render_files(loaded, cx))
                 .child(self.render_threads(loaded))
+                .child(self.render_timeline(loaded))
                 .into_any_element()
         } else {
             v_flex().into_any_element()
@@ -647,35 +666,78 @@ impl PullRequestPanel {
                     ),
             );
 
-        v_flex().gap_0p5().child(header).children(
-            loaded
-                .files
-                .iter()
-                .cloned()
-                .map(|file| self.render_file_row(file, cx)),
-        )
+        let rows = match layout {
+            FileLayout::Flat => v_flex()
+                .children(
+                    loaded
+                        .files
+                        .iter()
+                        .map(|file| self.render_file_row(file, file.path.to_string(), 0, cx)),
+                )
+                .into_any_element(),
+            FileLayout::Tree => {
+                let tree_rows = build_tree_rows(&loaded.files, &self.collapsed_dirs);
+                v_flex()
+                    .children(tree_rows.into_iter().map(|row| {
+                        if row.is_dir {
+                            self.render_dir_row(row.depth, row.name, row.dir_path, cx)
+                                .into_any_element()
+                        } else if let Some(file) = row.file_index.and_then(|i| loaded.files.get(i)) {
+                            self.render_file_row(file, row.name, row.depth, cx)
+                                .into_any_element()
+                        } else {
+                            div().into_any_element()
+                        }
+                    }))
+                    .into_any_element()
+            }
+        };
+
+        v_flex().gap_0p5().child(header).child(rows)
+    }
+
+    fn render_dir_row(
+        &self,
+        depth: usize,
+        name: String,
+        dir_path: String,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let collapsed = self.collapsed_dirs.contains(&dir_path);
+        let icon = if collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
+        h_flex()
+            .id(SharedString::from(format!("dir:{dir_path}")))
+            .w_full()
+            .py_0p5()
+            .pl(px(8.0 + depth as f32 * 12.0))
+            .gap_1()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+            .child(Label::new(name).size(LabelSize::Small).color(Color::Muted))
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.toggle_dir(dir_path.clone(), cx)
+            }))
     }
 
     fn render_file_row(
         &self,
-        file: PullRequestFile,
+        file: &PullRequestFile,
+        display: String,
+        depth: usize,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let viewed = file.viewed_state == ViewedState::Viewed;
         let path = file.path.clone();
-        let display = match self.file_layout {
-            FileLayout::Flat => file.path.to_string(),
-            FileLayout::Tree => file
-                .path
-                .rsplit('/')
-                .next()
-                .unwrap_or(&file.path)
-                .to_string(),
-        };
         h_flex()
             .w_full()
-            .px_2()
             .py_0p5()
+            .pl(px(8.0 + depth as f32 * 12.0))
+            .pr_2()
             .gap_2()
             .child(
                 Checkbox::new(
@@ -730,6 +792,69 @@ impl PullRequestPanel {
                             .child(Label::new(comment.body.clone()).size(LabelSize::Small))
                     }))
             }))
+    }
+}
+
+impl PullRequestPanel {
+    fn render_timeline(&self, loaded: &LoadedPullRequest) -> impl IntoElement {
+        v_flex()
+            .gap_0p5()
+            .when(!loaded.timeline.is_empty(), |this| {
+                this.child(Label::new("Activity").size(LabelSize::Small))
+            })
+            .children(loaded.timeline.iter().map(|item| {
+                let (icon, text) = timeline_presentation(item);
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+                    .child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted))
+            }))
+    }
+}
+
+/// Icon + one-line summary for a timeline entry.
+fn timeline_presentation(item: &TimelineItem) -> (IconName, String) {
+    match item {
+        TimelineItem::Commit { message, author, .. } => (
+            IconName::GitBranch,
+            format!(
+                "{} committed: {}",
+                author.as_ref().map(|a| a.login.as_ref()).unwrap_or("someone"),
+                message
+            ),
+        ),
+        TimelineItem::Review { author, verdict, .. } => {
+            let verb = match verdict {
+                ReviewVerdict::Approved => "approved",
+                ReviewVerdict::ChangesRequested => "requested changes",
+                ReviewVerdict::Dismissed => "dismissed a review",
+                _ => "reviewed",
+            };
+            (IconName::Check, format!("{} {}", author.login, verb))
+        }
+        TimelineItem::Comment { author, .. } => {
+            (IconName::QueueMessage, format!("{} commented", author.login))
+        }
+        TimelineItem::Merged { actor, .. } => (
+            IconName::GitBranch,
+            format!("{} merged", actor.as_ref().map(|a| a.login.as_ref()).unwrap_or("someone")),
+        ),
+        TimelineItem::Closed { actor, .. } => (
+            IconName::XCircle,
+            format!("{} closed", actor.as_ref().map(|a| a.login.as_ref()).unwrap_or("someone")),
+        ),
+        TimelineItem::Reopened { actor, .. } => (
+            IconName::CircleHelp,
+            format!("{} reopened", actor.as_ref().map(|a| a.login.as_ref()).unwrap_or("someone")),
+        ),
+        TimelineItem::HeadRefForcePushed { actor, .. } => (
+            IconName::GitBranch,
+            format!(
+                "{} force-pushed",
+                actor.as_ref().map(|a| a.login.as_ref()).unwrap_or("someone")
+            ),
+        ),
+        TimelineItem::Other { kind, .. } => (IconName::CircleHelp, kind.to_string()),
     }
 }
 
