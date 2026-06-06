@@ -105,6 +105,7 @@ struct LoadedPullRequest {
 enum ActiveView {
     List,
     Detail,
+    Create,
 }
 
 pub struct PullRequestPanel {
@@ -133,6 +134,12 @@ pub struct PullRequestPanel {
     collapsed_dirs: HashSet<String>,
     comment_editor: Entity<Editor>,
     composer_target: Option<ComposerTarget>,
+    create_title: Entity<Editor>,
+    create_body: Entity<Editor>,
+    create_base: Entity<Editor>,
+    create_head: Entity<Editor>,
+    create_draft: bool,
+    create_error: Option<SharedString>,
     _refresh_task: Option<Task<()>>,
     _detail_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -205,6 +212,18 @@ impl PullRequestPanel {
             editor.set_placeholder_text("Reply…", window, cx);
             editor
         });
+        let create_title = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Pull request title", window, cx);
+            editor
+        });
+        let create_body = cx.new(|cx| {
+            let mut editor = Editor::auto_height(2, 10, window, cx);
+            editor.set_placeholder_text("Description", window, cx);
+            editor
+        });
+        let create_base = cx.new(|cx| Editor::single_line(window, cx));
+        let create_head = cx.new(|cx| Editor::single_line(window, cx));
 
         let mut this = Self {
             workspace: weak_workspace,
@@ -230,6 +249,12 @@ impl PullRequestPanel {
             collapsed_dirs: HashSet::new(),
             comment_editor,
             composer_target: None,
+            create_title,
+            create_body,
+            create_base,
+            create_head,
+            create_draft: false,
+            create_error: None,
             _refresh_task: None,
             _detail_task: None,
             _subscriptions: vec![subscription],
@@ -365,6 +390,62 @@ impl PullRequestPanel {
         self.active_view = ActiveView::List;
         self.selected = None;
         cx.notify();
+    }
+
+    fn start_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Prefill head with the current branch.
+        let head = self
+            .active_repository
+            .as_ref()
+            .and_then(|repo| repo.read(cx).branch.as_ref().map(|b| b.ref_name.clone()))
+            .map(|name| name.trim_start_matches("refs/heads/").to_string())
+            .unwrap_or_default();
+        self.create_head
+            .update(cx, |editor, cx| editor.set_text(head, window, cx));
+        self.create_error = None;
+        self.active_view = ActiveView::Create;
+        cx.notify();
+    }
+
+    fn submit_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(provider), Some(owner), Some(repo)) =
+            (self.provider.clone(), self.owner.clone(), self.repo.clone())
+        else {
+            return;
+        };
+        let title = self.create_title.read(cx).text(cx);
+        let base = self.create_base.read(cx).text(cx);
+        let head = self.create_head.read(cx).text(cx);
+        if title.trim().is_empty() || base.trim().is_empty() || head.trim().is_empty() {
+            self.create_error = Some("Title, base, and head are required".into());
+            cx.notify();
+            return;
+        }
+        let input = CreatePullRequest {
+            owner: owner.into(),
+            repo: repo.into(),
+            base_ref: base.trim().to_string().into(),
+            head_ref: head.trim().to_string().into(),
+            title: title.into(),
+            body: self.create_body.read(cx).text(cx).into(),
+            draft: self.create_draft,
+        };
+        let _ = window;
+        cx.spawn(async move |this, cx| {
+            let result = provider.create_pull_request(&input).await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(_) => {
+                        this.active_view = ActiveView::List;
+                        this.refresh_list(cx);
+                    }
+                    Err(error) => this.create_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn toggle_dir(&mut self, dir_path: String, cx: &mut Context<Self>) {
@@ -910,9 +991,20 @@ impl PullRequestPanel {
                     })),
             )
             .child(
-                IconButton::new("refresh-list", IconName::RotateCw)
-                    .tooltip(Tooltip::text("Refresh"))
-                    .on_click(cx.listener(|this, _, _window, cx| this.refresh_list(cx))),
+                h_flex()
+                    .gap_1()
+                    .child(
+                        IconButton::new("create-pr", IconName::Plus)
+                            .tooltip(Tooltip::text("New pull request"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.start_create(window, cx)
+                            })),
+                    )
+                    .child(
+                        IconButton::new("refresh-list", IconName::RotateCw)
+                            .tooltip(Tooltip::text("Refresh"))
+                            .on_click(cx.listener(|this, _, _window, cx| this.refresh_list(cx))),
+                    ),
             );
 
         let auth_status = h_flex().px_2().pb_1().child(
@@ -986,6 +1078,73 @@ impl PullRequestPanel {
             .on_click(cx.listener(move |this, _, _window, cx| {
                 this.select_pull_request(pr.clone(), cx)
             }))
+    }
+
+    fn render_create(&self, cx: &Context<Self>) -> impl IntoElement {
+        let header = h_flex()
+            .gap_1()
+            .p_2()
+            .child(
+                IconButton::new("create-back", IconName::ArrowLeft)
+                    .tooltip(Tooltip::text("Back to list"))
+                    .on_click(cx.listener(|this, _, _window, cx| this.back_to_list(cx))),
+            )
+            .child(Label::new("New pull request").size(LabelSize::Small));
+
+        v_flex()
+            .size_full()
+            .child(header)
+            .child(
+                v_flex()
+                    .gap_2()
+                    .p_2()
+                    .when_some(self.create_error.clone(), |this, error| {
+                        this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+                    })
+                    .child(Label::new("Title").size(LabelSize::XSmall).color(Color::Muted))
+                    .child(self.create_title.clone())
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        Label::new("Base")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(self.create_base.clone()),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        Label::new("Head")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(self.create_head.clone()),
+                            ),
+                    )
+                    .child(Label::new("Description").size(LabelSize::XSmall).color(Color::Muted))
+                    .child(self.create_body.clone())
+                    .child(
+                        Checkbox::new("create-draft", to_toggle(self.create_draft))
+                            .label("Create as draft")
+                            .on_click(cx.listener(|this, state: &ToggleState, _window, cx| {
+                                this.create_draft = *state == ToggleState::Selected;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("create-submit", "Create pull request")
+                            .style(ButtonStyle::Filled)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_create(window, cx)
+                            })),
+                    ),
+            )
     }
 
     fn render_detail(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1913,6 +2072,7 @@ impl Render for PullRequestPanel {
         let content = match self.active_view {
             ActiveView::List => self.render_list(cx).into_any_element(),
             ActiveView::Detail => self.render_detail(cx).into_any_element(),
+            ActiveView::Create => self.render_create(cx).into_any_element(),
         };
         v_flex()
             .key_context("PullRequestPanel")
