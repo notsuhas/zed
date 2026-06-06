@@ -14,8 +14,11 @@ use gpui::{
     SharedString, Subscription, Task, WeakEntity, Window,
 };
 use crate::file_tree::build_tree_rows;
+use buffer_diff::BufferDiff;
 use editor::Editor;
 use http_client::HttpClient;
+use language::Buffer;
+use multi_buffer::MultiBuffer;
 use project::Project;
 use project::git_store::{GitStoreEvent, Repository};
 use settings::Settings as _;
@@ -482,6 +485,66 @@ impl PullRequestPanel {
         .detach();
     }
 
+    /// Fetch a file's base+head content from GitHub and open a read-only diff
+    /// in the workspace center pane (matching the VS Code extension, which
+    /// diffs API-fetched blob text rather than the local checkout).
+    fn open_file_diff(&mut self, path: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
+            return;
+        };
+        let info = &loaded.detail.info;
+        let owner = info.id.owner.to_string();
+        let repo = info.id.repo.to_string();
+        let base_sha = info.base_sha.to_string();
+        let head_sha = info.head_sha.to_string();
+        let project = self.project.clone();
+        let workspace = self.workspace.clone();
+
+        cx.spawn_in(window, async move |_this, cx| {
+            let base = provider
+                .fetch_file_content(&owner, &repo, &format!("{base_sha}:{path}"))
+                .await
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let head = provider
+                .fetch_file_content(&owner, &repo, &format!("{head_sha}:{path}"))
+                .await
+                .unwrap_or(None)
+                .unwrap_or_default();
+
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let head_buffer = cx.new(|cx| Buffer::local(head.to_string(), cx));
+                    let snapshot = head_buffer.read(cx).snapshot();
+                    let diff = cx.new(|cx| BufferDiff::new(&snapshot.text, cx));
+                    diff.update(cx, |diff, cx| {
+                        // Diff computes asynchronously; the editor re-renders when ready.
+                        let _ = diff.set_base_text(
+                            Some(std::sync::Arc::from(base.as_ref())),
+                            None,
+                            snapshot.text.clone(),
+                            cx,
+                        );
+                    });
+                    let multibuffer = cx.new(|cx| {
+                        let mut multibuffer = MultiBuffer::singleton(head_buffer.clone(), cx);
+                        multibuffer.add_diff(diff, cx);
+                        multibuffer
+                    });
+                    let editor = cx.new(|cx| {
+                        let mut editor =
+                            Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx);
+                        editor.set_read_only(true);
+                        editor
+                    });
+                    workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
+                })
+                .ok();
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
     fn merge_selected(&mut self, method: MergeMethod, cx: &mut Context<Self>) {
         let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
             return;
@@ -546,17 +609,32 @@ impl PullRequestPanel {
 
 impl PullRequestPanel {
     fn render_list(&self, cx: &Context<Self>) -> impl IntoElement {
-        let filters = h_flex().gap_1().p_2().children(ListFilter::ALL.map(|filter| {
-            let selected = filter == self.filter;
-            Button::new(SharedString::from(filter.label()), filter.label())
-                .label_size(LabelSize::Small)
-                .style(if selected {
-                    ButtonStyle::Filled
-                } else {
-                    ButtonStyle::Subtle
-                })
-                .on_click(cx.listener(move |this, _, _window, cx| this.set_filter(filter, cx)))
-        }));
+        let filters = h_flex()
+            .gap_1()
+            .p_2()
+            .justify_between()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .children(ListFilter::ALL.map(|filter| {
+                        let selected = filter == self.filter;
+                        Button::new(SharedString::from(filter.label()), filter.label())
+                            .label_size(LabelSize::Small)
+                            .style(if selected {
+                                ButtonStyle::Filled
+                            } else {
+                                ButtonStyle::Subtle
+                            })
+                            .on_click(
+                                cx.listener(move |this, _, _window, cx| this.set_filter(filter, cx)),
+                            )
+                    })),
+            )
+            .child(
+                IconButton::new("refresh-list", IconName::RotateCw)
+                    .tooltip(Tooltip::text("Refresh"))
+                    .on_click(cx.listener(|this, _, _window, cx| this.refresh_list(cx))),
+            );
 
         let auth_status = h_flex().px_2().pb_1().child(
             Label::new(format!("Auth: {}", self.auth_source.label()))
@@ -635,12 +713,22 @@ impl PullRequestPanel {
         let header = h_flex()
             .gap_1()
             .p_2()
+            .justify_between()
             .child(
-                IconButton::new("back", IconName::ArrowLeft)
-                    .tooltip(Tooltip::text("Back to list"))
-                    .on_click(cx.listener(|this, _, _window, cx| this.back_to_list(cx))),
+                h_flex()
+                    .gap_1()
+                    .child(
+                        IconButton::new("back", IconName::ArrowLeft)
+                            .tooltip(Tooltip::text("Back to list"))
+                            .on_click(cx.listener(|this, _, _window, cx| this.back_to_list(cx))),
+                    )
+                    .child(Label::new("Pull Request").size(LabelSize::Small)),
             )
-            .child(Label::new("Pull Request").size(LabelSize::Small));
+            .child(
+                IconButton::new("refresh-detail", IconName::RotateCw)
+                    .tooltip(Tooltip::text("Refresh"))
+                    .on_click(cx.listener(|this, _, _window, cx| this.refresh_detail(cx))),
+            );
 
         let body = if self.detail_loading {
             v_flex()
@@ -891,6 +979,7 @@ impl PullRequestPanel {
     ) -> impl IntoElement {
         let viewed = file.viewed_state == ViewedState::Viewed;
         let path = file.path.clone();
+        let open_path = file.path.clone();
         h_flex()
             .w_full()
             .py_0p5()
@@ -906,11 +995,19 @@ impl PullRequestPanel {
                     this.toggle_file_viewed(path.clone(), cx)
                 })),
             )
-            .child(Label::new(display).size(LabelSize::Small).color(if viewed {
-                Color::Muted
-            } else {
-                Color::Default
-            }))
+            .child(
+                div()
+                    .id(SharedString::from(format!("open:{open_path}")))
+                    .cursor_pointer()
+                    .child(Label::new(display).size(LabelSize::Small).color(if viewed {
+                        Color::Muted
+                    } else {
+                        Color::Default
+                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_file_diff(open_path.clone(), window, cx)
+                    })),
+            )
             .child(
                 Label::new(format!("+{} -{}", file.additions, file.deletions))
                     .size(LabelSize::XSmall)

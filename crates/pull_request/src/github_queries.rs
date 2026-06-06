@@ -363,6 +363,21 @@ pub fn create_pull_request() -> String {
     )
 }
 
+/// Fetch a file's text content at a commit. `$expression` is `<oid>:<path>`.
+/// `object` is null when the path doesn't exist at that revision (e.g. an
+/// added file has no base content).
+pub fn file_content() -> &'static str {
+    r#"
+    query FileContent($owner: String!, $name: String!, $expression: String!) {
+      repository(owner: $owner, name: $name) {
+        object(expression: $expression) {
+          ... on Blob { text isBinary }
+        }
+      }
+    }
+    "#
+}
+
 /// Resolve a repository's node id (needed for createPullRequest).
 pub fn repository_id() -> &'static str {
     r#"

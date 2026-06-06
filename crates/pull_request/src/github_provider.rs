@@ -1172,6 +1172,46 @@ impl PullRequestProvider for GitHubProvider {
                 .into_info(&input.owner, &input.repo))
         })
     }
+
+    fn fetch_file_content<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+        expression: &'a str,
+    ) -> ProviderFuture<'a, Option<SharedString>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Data {
+                repository: RepoObject,
+            }
+            #[derive(Deserialize)]
+            struct RepoObject {
+                object: Option<Blob>,
+            }
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Blob {
+                #[serde(default)]
+                text: Option<String>,
+                #[serde(default)]
+                is_binary: Option<bool>,
+            }
+            let data: Data = execute(
+                &self.http_client,
+                self.token(),
+                q::file_content(),
+                serde_json::json!({ "owner": owner, "name": repo, "expression": expression }),
+            )
+            .await?;
+            Ok(data.repository.object.and_then(|blob| {
+                if blob.is_binary == Some(true) {
+                    None
+                } else {
+                    blob.text.map(SharedString::from)
+                }
+            }))
+        })
+    }
 }
 
 #[cfg(test)]

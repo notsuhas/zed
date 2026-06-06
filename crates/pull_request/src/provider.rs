@@ -455,4 +455,13 @@ pub trait PullRequestProvider: Send + Sync {
         &'a self,
         input: &'a CreatePullRequest,
     ) -> ProviderFuture<'a, PullRequestInfo>;
+
+    /// Fetch a file's text content at a revision (`<oid>:<path>` expression).
+    /// `None` means the path didn't exist at that revision or is binary.
+    fn fetch_file_content<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+        expression: &'a str,
+    ) -> ProviderFuture<'a, Option<SharedString>>;
 }

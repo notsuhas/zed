@@ -14258,6 +14258,7 @@ name = "pull_request"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "buffer_diff",
  "collections",
  "credentials_provider",
  "editor",
@@ -14268,9 +14269,11 @@ dependencies = [
  "git_ui",
  "gpui",
  "http_client",
+ "language",
  "log",
  "markdown",
  "menu",
+ "multi_buffer",
  "project",
  "schemars 1.0.4",
  "serde",
