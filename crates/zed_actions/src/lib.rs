@@ -738,7 +738,9 @@ pub mod pull_request {
             /// Toggles focus on the Pull Requests panel.
             ToggleFocus,
             /// Opens the selected file in the editor (working tree version).
-            OpenLocalFile
+            OpenLocalFile,
+            /// Starts a review comment on the line at the cursor in a PR diff.
+            AddComment
         ]
     );
 }

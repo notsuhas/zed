@@ -35,7 +35,7 @@ use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
-use zed_actions::pull_request::ToggleFocus;
+use zed_actions::pull_request::{AddComment, ToggleFocus};
 
 const PULL_REQUEST_PANEL_KEY: &str = "PullRequestPanel";
 
@@ -83,6 +83,15 @@ enum FileLayout {
     Flat,
 }
 
+/// What the shared comment composer is currently targeting.
+#[derive(Clone, PartialEq)]
+enum ComposerTarget {
+    /// Reply to an existing thread.
+    Reply(SharedString),
+    /// Start a new thread on a file line (right side).
+    NewThread { path: SharedString, line: u32 },
+}
+
 /// Everything fetched for the selected pull request.
 struct LoadedPullRequest {
     detail: PullRequest,
@@ -121,7 +130,7 @@ pub struct PullRequestPanel {
     file_layout: FileLayout,
     collapsed_dirs: HashSet<String>,
     comment_editor: Entity<Editor>,
-    reply_target: Option<SharedString>,
+    composer_target: Option<ComposerTarget>,
     _refresh_task: Option<Task<()>>,
     _detail_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -130,6 +139,33 @@ pub struct PullRequestPanel {
 pub fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
         workspace.toggle_panel_focus::<PullRequestPanel>(window, cx);
+    });
+
+    // Start a review comment on the current line of the focused diff editor.
+    workspace.register_action(|workspace, _: &AddComment, window, cx| {
+        let Some(panel) = workspace.panel::<PullRequestPanel>(cx) else {
+            return;
+        };
+        let Some(editor) = workspace
+            .active_item(cx)
+            .and_then(|item| item.act_as::<Editor>(cx))
+        else {
+            return;
+        };
+        let Some((path, line)) = editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let head = editor.selections.newest_anchor().head();
+            let row = snapshot.summary_for_anchor::<Point>(&head).row;
+            let buffer = editor.buffer().read(cx).as_singleton()?;
+            let file = buffer.read(cx).file()?;
+            let path = SharedString::from(file.path().as_std_path().to_string_lossy().to_string());
+            Some((path, row + 1))
+        }) else {
+            return;
+        };
+        panel.update(cx, |panel, cx| {
+            panel.start_new_thread(path, line, window, cx);
+        });
     });
 }
 
@@ -191,7 +227,7 @@ impl PullRequestPanel {
             file_layout: FileLayout::Tree,
             collapsed_dirs: HashSet::new(),
             comment_editor,
-            reply_target: None,
+            composer_target: None,
             _refresh_task: None,
             _detail_task: None,
             _subscriptions: vec![subscription],
@@ -363,14 +399,31 @@ impl PullRequestPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.reply_target = Some(thread_id);
+        self.set_composer(ComposerTarget::Reply(thread_id), window, cx);
+    }
+
+    /// Begin a new inline comment on a file line (invoked from the diff via the
+    /// `AddComment` action).
+    pub fn start_new_thread(
+        &mut self,
+        path: SharedString,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_view = ActiveView::Detail;
+        self.set_composer(ComposerTarget::NewThread { path, line }, window, cx);
+    }
+
+    fn set_composer(&mut self, target: ComposerTarget, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer_target = Some(target);
         let handle = self.comment_editor.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
         cx.notify();
     }
 
-    fn submit_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(target) = self.reply_target.clone() else {
+    fn submit_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.composer_target.clone() else {
             return;
         };
         let body = self.comment_editor.read(cx).text(cx);
@@ -380,18 +433,27 @@ impl PullRequestPanel {
         let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
             return;
         };
+        let comment_target = match target {
+            ComposerTarget::Reply(thread_id) => CommentTarget::Reply {
+                in_reply_to: thread_id,
+            },
+            ComposerTarget::NewThread { path, line } => CommentTarget::NewThread {
+                path,
+                side: DiffSide::Right,
+                line,
+                start_line: None,
+            },
+        };
         let new_comment = NewComment {
             pull_request: loaded.detail.info.id.clone(),
             body: body.into(),
-            target: CommentTarget::Reply {
-                in_reply_to: target,
-            },
+            target: comment_target,
             review_id: None,
             commit_sha: loaded.detail.info.head_sha.clone(),
         };
         self.comment_editor
             .update(cx, |editor, cx| editor.clear(window, cx));
-        self.reply_target = None;
+        self.composer_target = None;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -1094,8 +1156,26 @@ impl PullRequestPanel {
     }
 
     fn render_threads(&self, loaded: &LoadedPullRequest, cx: &Context<Self>) -> impl IntoElement {
+        let new_thread = if let Some(ComposerTarget::NewThread { path, line }) = &self.composer_target
+        {
+            Some(
+                v_flex()
+                    .gap_0p5()
+                    .p_1()
+                    .child(
+                        Label::new(format!("New comment on {path}:{line}"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(self.render_composer(cx)),
+            )
+        } else {
+            None
+        };
+
         v_flex()
             .gap_1()
+            .when_some(new_thread, |this, new_thread| this.child(new_thread))
             .when(!loaded.threads.is_empty(), |this| {
                 this.child(Label::new("Review comments").size(LabelSize::Small))
             })
@@ -1125,7 +1205,8 @@ impl PullRequestPanel {
         } else {
             thread.viewer_can_resolve
         };
-        let is_replying = self.reply_target.as_ref() == Some(&thread.id);
+        let is_replying =
+            matches!(&self.composer_target, Some(ComposerTarget::Reply(id)) if id == &thread.id);
 
         let header = h_flex()
             .gap_2()
@@ -1184,20 +1265,36 @@ impl PullRequestPanel {
             .p_1()
             .child(header)
             .children(thread.comments.iter().map(render_comment))
-            .when(is_replying, |this| {
-                this.child(
-                    v_flex()
-                        .gap_1()
-                        .child(self.comment_editor.clone())
-                        .child(
-                            Button::new("submit-reply", "Comment")
-                                .label_size(LabelSize::XSmall)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.submit_reply(window, cx)
-                                })),
-                        ),
-                )
-            })
+            .when(is_replying, |this| this.child(self.render_composer(cx)))
+    }
+
+    /// The shared comment composer (editor + submit/cancel), used for replies
+    /// and new threads.
+    fn render_composer(&self, cx: &Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_1()
+            .p_1()
+            .child(self.comment_editor.clone())
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("submit-comment", "Comment")
+                            .label_size(LabelSize::XSmall)
+                            .style(ButtonStyle::Filled)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.submit_comment(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("cancel-comment", "Cancel")
+                            .label_size(LabelSize::XSmall)
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.composer_target = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
     }
 }
 
