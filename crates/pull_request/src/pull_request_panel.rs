@@ -513,15 +513,81 @@ impl PullRequestPanel {
         loaded: &LoadedPullRequest,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let info = &loaded.detail.info;
+        let detail = &loaded.detail;
+        let info = &detail.info;
+
+        let state_label = match info.state {
+            PullRequestState::Open if info.is_draft => ("Draft", Color::Muted),
+            PullRequestState::Open => ("Open", Color::Success),
+            PullRequestState::Merged => ("Merged", Color::Accent),
+            PullRequestState::Closed => ("Closed", Color::Error),
+        };
+
+        let title_row = h_flex()
+            .gap_2()
+            .child(Label::new(state_label.0).size(LabelSize::Small).color(state_label.1))
+            .child(Label::new(format!("#{}", info.id.number)).size(LabelSize::Small).color(Color::Muted))
+            .child(Label::new(info.title.clone()));
+
+        let labels = (!detail.labels.is_empty()).then(|| {
+            h_flex().gap_1().flex_wrap().children(detail.labels.iter().map(|label| {
+                Label::new(label.clone()).size(LabelSize::XSmall).color(Color::Accent)
+            }))
+        });
+
+        let reviewers = (!detail.reviewers.is_empty()).then(|| {
+            h_flex().gap_2().flex_wrap().children(detail.reviewers.iter().map(|reviewer| {
+                let (icon, color) = match reviewer.verdict {
+                    Some(ReviewVerdict::Approved) => (IconName::Check, Color::Success),
+                    Some(ReviewVerdict::ChangesRequested) => (IconName::XCircle, Color::Error),
+                    Some(ReviewVerdict::Commented) => (IconName::QueueMessage, Color::Muted),
+                    _ => (IconName::CircleHelp, Color::Muted),
+                };
+                h_flex()
+                    .gap_0p5()
+                    .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+                    .child(
+                        Label::new(reviewer.actor.login.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+            }))
+        });
+
+        let checks = detail.check_rollup.map(|rollup| {
+            let (icon, color, text) = check_presentation(rollup);
+            h_flex()
+                .gap_1()
+                .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+                .child(
+                    Label::new(format!("Checks: {} ({})", text, detail.checks.len()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+        });
+
+        let mergeable = detail.mergeable.map(|mergeable| {
+            Label::new(if mergeable {
+                "Mergeable"
+            } else {
+                "Conflicts"
+            })
+            .size(LabelSize::XSmall)
+            .color(if mergeable { Color::Success } else { Color::Warning })
+        });
+
         v_flex()
             .gap_1()
-            .child(Label::new(info.title.clone()))
+            .child(title_row)
             .child(
                 Label::new(format!("{} → {}", info.head_ref, info.base_ref))
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
+            .when_some(labels, |this, labels| this.child(labels))
+            .when_some(reviewers, |this, reviewers| this.child(reviewers))
+            .when_some(checks, |this, checks| this.child(checks))
+            .when_some(mergeable, |this, mergeable| this.child(mergeable))
             .child(
                 h_flex()
                     .gap_1()
@@ -672,6 +738,17 @@ fn to_toggle(checked: bool) -> ToggleState {
         ToggleState::Selected
     } else {
         ToggleState::Unselected
+    }
+}
+
+/// Icon/color/label for an aggregate CI status.
+fn check_presentation(status: CheckStatus) -> (IconName, Color, &'static str) {
+    match status {
+        CheckStatus::Success => (IconName::Check, Color::Success, "passing"),
+        CheckStatus::Failure | CheckStatus::Error => (IconName::XCircle, Color::Error, "failing"),
+        CheckStatus::Cancelled => (IconName::XCircle, Color::Muted, "cancelled"),
+        CheckStatus::Pending => (IconName::Warning, Color::Warning, "pending"),
+        CheckStatus::Neutral | CheckStatus::Skipped => (IconName::CircleHelp, Color::Muted, "neutral"),
     }
 }
 
