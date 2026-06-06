@@ -410,6 +410,15 @@ pub trait PullRequestProvider: Send + Sync {
         body: &'a str,
     ) -> ProviderFuture<'a, ReviewComment>;
 
+    /// Delete a review comment (by REST database id — GitHub has no GraphQL
+    /// mutation for this).
+    fn delete_comment<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+        comment_database_id: u64,
+    ) -> ProviderFuture<'a, ()>;
+
     /// Submit a pending review (or post a single review when `review_id` is the
     /// freshly-started batch).
     fn submit_review<'a>(

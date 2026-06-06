@@ -90,6 +90,8 @@ enum ComposerTarget {
     Reply(SharedString),
     /// Start a new thread on a file line (right side).
     NewThread { path: SharedString, line: u32 },
+    /// Edit an existing comment.
+    Edit(SharedString),
 }
 
 /// Everything fetched for the selected pull request.
@@ -415,6 +417,18 @@ impl PullRequestPanel {
         self.set_composer(ComposerTarget::NewThread { path, line }, window, cx);
     }
 
+    fn start_edit(
+        &mut self,
+        comment_id: SharedString,
+        body: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.comment_editor
+            .update(cx, |editor, cx| editor.set_text(body.to_string(), window, cx));
+        self.set_composer(ComposerTarget::Edit(comment_id), window, cx);
+    }
+
     fn set_composer(&mut self, target: ComposerTarget, window: &mut Window, cx: &mut Context<Self>) {
         self.composer_target = Some(target);
         let handle = self.comment_editor.read(cx).focus_handle(cx);
@@ -433,6 +447,29 @@ impl PullRequestPanel {
         let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
             return;
         };
+        let pull_request = loaded.detail.info.id.clone();
+        let commit_sha = loaded.detail.info.head_sha.clone();
+        self.comment_editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
+        self.composer_target = None;
+        cx.notify();
+
+        // Editing routes to a different mutation than posting.
+        if let ComposerTarget::Edit(comment_id) = target {
+            cx.spawn(async move |this, cx| {
+                let result = provider.edit_comment(&comment_id, &body).await;
+                this.update(cx, |this, cx| {
+                    if let Err(error) = result {
+                        this.detail_error = Some(error.to_string().into());
+                    }
+                    this.refresh_threads(cx);
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+
         let comment_target = match target {
             ComposerTarget::Reply(thread_id) => CommentTarget::Reply {
                 in_reply_to: thread_id,
@@ -443,21 +480,65 @@ impl PullRequestPanel {
                 line,
                 start_line: None,
             },
+            ComposerTarget::Edit(_) => unreachable!(),
         };
         let new_comment = NewComment {
-            pull_request: loaded.detail.info.id.clone(),
+            pull_request,
             body: body.into(),
             target: comment_target,
             review_id: None,
-            commit_sha: loaded.detail.info.head_sha.clone(),
+            commit_sha,
         };
-        self.comment_editor
-            .update(cx, |editor, cx| editor.clear(window, cx));
-        self.composer_target = None;
-        cx.notify();
-
         cx.spawn(async move |this, cx| {
             let result = provider.add_comment(&new_comment).await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.detail_error = Some(error.to_string().into());
+                }
+                this.refresh_threads(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn toggle_reaction(
+        &mut self,
+        subject_id: SharedString,
+        content: SharedString,
+        reacted: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(provider) = self.provider.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = if reacted {
+                provider.remove_reaction(&subject_id, &content).await
+            } else {
+                provider.add_reaction(&subject_id, &content).await
+            };
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.detail_error = Some(error.to_string().into());
+                }
+                this.refresh_threads(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn delete_comment(&mut self, comment_database_id: u64, cx: &mut Context<Self>) {
+        let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
+            return;
+        };
+        let owner = loaded.detail.info.id.owner.to_string();
+        let repo = loaded.detail.info.id.repo.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = provider
+                .delete_comment(&owner, &repo, comment_database_id)
+                .await;
             this.update(cx, |this, cx| {
                 if let Err(error) = result {
                     this.detail_error = Some(error.to_string().into());
@@ -1264,8 +1345,104 @@ impl PullRequestPanel {
             .gap_0p5()
             .p_1()
             .child(header)
-            .children(thread.comments.iter().map(render_comment))
+            .children(thread.comments.iter().map(|comment| self.render_comment(comment, cx)))
             .when(is_replying, |this| this.child(self.render_composer(cx)))
+    }
+
+    fn render_comment(&self, comment: &ReviewComment, cx: &Context<Self>) -> impl IntoElement {
+        let is_editing =
+            matches!(&self.composer_target, Some(ComposerTarget::Edit(id)) if id == &comment.id);
+        let id = comment.id.clone();
+        let body = comment.body.clone();
+        let database_id = comment.database_id;
+        let reactions = h_flex()
+            .gap_1()
+            // Existing reaction groups toggle on click.
+            .children(
+                comment
+                    .reactions
+                    .iter()
+                    .filter(|group| group.count > 0)
+                    .map(|group| {
+                        let reacted = group.viewer_has_reacted;
+                        let subject = comment.id.clone();
+                        let content = group.content.clone();
+                        Button::new(
+                            SharedString::from(format!("react:{}:{}", comment.id, group.content)),
+                            format!("{} {}", reaction_emoji(&group.content), group.count),
+                        )
+                        .label_size(LabelSize::XSmall)
+                        .style(if reacted {
+                            ButtonStyle::Filled
+                        } else {
+                            ButtonStyle::Subtle
+                        })
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.toggle_reaction(subject.clone(), content.clone(), reacted, cx)
+                        }))
+                    }),
+            )
+            // Quick "add 👍".
+            .child({
+                let subject = comment.id.clone();
+                let already = comment
+                    .reactions
+                    .iter()
+                    .any(|g| g.content.as_ref() == "THUMBS_UP" && g.viewer_has_reacted);
+                IconButton::new(
+                    SharedString::from(format!("react-add:{}", comment.id)),
+                    IconName::QueueMessage,
+                )
+                .tooltip(Tooltip::text("React 👍"))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.toggle_reaction(subject.clone(), "THUMBS_UP".into(), already, cx)
+                }))
+            });
+
+        v_flex()
+            .gap_0p5()
+            .py_0p5()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(Label::new(comment.author.login.clone()).size(LabelSize::XSmall))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .when(comment.viewer_can_update, |this| {
+                                this.child(
+                                    Button::new(
+                                        SharedString::from(format!("edit:{id}")),
+                                        "Edit",
+                                    )
+                                    .label_size(LabelSize::XSmall)
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        let body = body.clone();
+                                        move |this, _, window, cx| {
+                                            this.start_edit(id.clone(), body.clone(), window, cx)
+                                        }
+                                    })),
+                                )
+                            })
+                            .when(comment.viewer_can_delete && database_id.is_some(), |this| {
+                                let database_id = database_id.unwrap_or_default();
+                                this.child(
+                                    Button::new(
+                                        SharedString::from(format!("delete:{id}")),
+                                        "Delete",
+                                    )
+                                    .label_size(LabelSize::XSmall)
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        this.delete_comment(database_id, cx)
+                                    })),
+                                )
+                            }),
+                    ),
+            )
+            .child(Label::new(comment.body.clone()).size(LabelSize::Small))
+            .child(reactions)
+            .when(is_editing, |this| this.child(self.render_composer(cx)))
     }
 
     /// The shared comment composer (editor + submit/cancel), used for replies
@@ -1296,33 +1473,6 @@ impl PullRequestPanel {
                     ),
             )
     }
-}
-
-fn render_comment(comment: &ReviewComment) -> impl IntoElement {
-    let reactions = (!comment.reactions.is_empty()).then(|| {
-        h_flex().gap_1().children(
-            comment
-                .reactions
-                .iter()
-                .filter(|group| group.count > 0)
-                .map(|group| {
-                    Label::new(format!("{} {}", reaction_emoji(&group.content), group.count))
-                        .size(LabelSize::XSmall)
-                        .color(if group.viewer_has_reacted {
-                            Color::Accent
-                        } else {
-                            Color::Muted
-                        })
-                }),
-        )
-    });
-
-    v_flex()
-        .gap_0p5()
-        .py_0p5()
-        .child(Label::new(comment.author.login.clone()).size(LabelSize::XSmall))
-        .child(Label::new(comment.body.clone()).size(LabelSize::Small))
-        .when_some(reactions, |this, reactions| this.child(reactions))
 }
 
 /// Map a GitHub reaction content enum to an emoji.

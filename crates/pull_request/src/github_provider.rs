@@ -9,10 +9,14 @@
 use crate::github_graphql::execute;
 use crate::github_queries as q;
 use crate::provider::*;
+use anyhow::bail;
+use futures::AsyncReadExt as _;
 use gpui::SharedString;
-use http_client::HttpClient;
+use http_client::{AsyncBody, HttpClient, Request};
 use serde::Deserialize;
 use std::sync::Arc;
+
+const GITHUB_REST_URL: &str = "https://api.github.com";
 
 pub struct GitHubProvider {
     http_client: Arc<dyn HttpClient>,
@@ -1170,6 +1174,37 @@ impl PullRequestProvider for GitHubProvider {
                 .create_pull_request
                 .pull_request
                 .into_info(&input.owner, &input.repo))
+        })
+    }
+
+    fn delete_comment<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+        comment_database_id: u64,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let url = format!(
+                "{GITHUB_REST_URL}/repos/{owner}/{repo}/pulls/comments/{comment_database_id}"
+            );
+            let mut builder = Request::delete(&url)
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", "Zed");
+            if let Some(token) = self.token() {
+                builder = builder.header("Authorization", format!("Bearer {token}"));
+            }
+            let request = builder.body(AsyncBody::default())?;
+            let mut response = self.http_client.send(request).await?;
+            if !response.status().is_success() {
+                let mut body = Vec::new();
+                response.body_mut().read_to_end(&mut body).await?;
+                bail!(
+                    "GitHub REST delete-comment {}: {}",
+                    response.status().as_u16(),
+                    String::from_utf8_lossy(&body)
+                );
+            }
+            Ok(())
         })
     }
 
