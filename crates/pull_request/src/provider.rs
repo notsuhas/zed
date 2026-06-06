@@ -451,6 +451,29 @@ pub trait PullRequestProvider: Send + Sync {
         content: &'a str,
     ) -> ProviderFuture<'a, ()>;
 
+    /// Close a pull request.
+    fn close_pull_request<'a>(&'a self, pull_request_node_id: &'a str) -> ProviderFuture<'a, ()>;
+
+    /// Reopen a closed pull request.
+    fn reopen_pull_request<'a>(&'a self, pull_request_node_id: &'a str) -> ProviderFuture<'a, ()>;
+
+    /// Mark a draft pull request ready for review.
+    fn mark_ready_for_review<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+    ) -> ProviderFuture<'a, ()>;
+
+    /// Convert a pull request back to draft.
+    fn convert_to_draft<'a>(&'a self, pull_request_node_id: &'a str) -> ProviderFuture<'a, ()>;
+
+    /// Update a pull request's title and/or body.
+    fn update_pull_request<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        title: Option<&'a str>,
+        body: Option<&'a str>,
+    ) -> ProviderFuture<'a, ()>;
+
     /// Merge a pull request.
     fn merge_pull_request<'a>(
         &'a self,

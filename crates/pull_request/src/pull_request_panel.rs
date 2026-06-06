@@ -778,6 +778,52 @@ impl PullRequestPanel {
         .detach();
     }
 
+    fn close_or_reopen(&mut self, cx: &mut Context<Self>) {
+        let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
+            return;
+        };
+        let is_open = loaded.detail.info.state == PullRequestState::Open;
+        let node_id = loaded.detail.info.id.node_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = if is_open {
+                provider.close_pull_request(&node_id).await
+            } else {
+                provider.reopen_pull_request(&node_id).await
+            };
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.detail_error = Some(error.to_string().into());
+                }
+                this.refresh_detail(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn toggle_draft(&mut self, cx: &mut Context<Self>) {
+        let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
+            return;
+        };
+        let is_draft = loaded.detail.info.is_draft;
+        let node_id = loaded.detail.info.id.node_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = if is_draft {
+                provider.mark_ready_for_review(&node_id).await
+            } else {
+                provider.convert_to_draft(&node_id).await
+            };
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.detail_error = Some(error.to_string().into());
+                }
+                this.refresh_detail(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn merge_selected(&mut self, method: MergeMethod, cx: &mut Context<Self>) {
         let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
             return;
@@ -1139,16 +1185,62 @@ impl PullRequestPanel {
                             && !info.is_draft,
                         |this| {
                             this.child(
-                                ui::Button::new("merge", "Squash & merge")
+                                Button::new("merge-merge", "Merge")
+                                    .label_size(LabelSize::Small)
+                                    .style(ButtonStyle::Filled)
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.merge_selected(MergeMethod::Merge, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("merge-squash", "Squash")
                                     .label_size(LabelSize::Small)
                                     .style(ButtonStyle::Filled)
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         this.merge_selected(MergeMethod::Squash, cx)
                                     })),
                             )
+                            .child(
+                                Button::new("merge-rebase", "Rebase")
+                                    .label_size(LabelSize::Small)
+                                    .style(ButtonStyle::Filled)
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.merge_selected(MergeMethod::Rebase, cx)
+                                    })),
+                            )
                         },
                     ),
             )
+            .when(detail.viewer_can_update, |this| {
+                let is_open = info.state == PullRequestState::Open;
+                let is_draft = info.is_draft;
+                this.child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new(
+                                "close-reopen",
+                                if is_open { "Close" } else { "Reopen" },
+                            )
+                            .label_size(LabelSize::Small)
+                            .on_click(
+                                cx.listener(|this, _, _window, cx| this.close_or_reopen(cx)),
+                            ),
+                        )
+                        .when(is_open, |this| {
+                            this.child(
+                                Button::new(
+                                    "draft-toggle",
+                                    if is_draft { "Ready for review" } else { "Convert to draft" },
+                                )
+                                .label_size(LabelSize::Small)
+                                .on_click(
+                                    cx.listener(|this, _, _window, cx| this.toggle_draft(cx)),
+                                ),
+                            )
+                        }),
+                )
+            })
     }
 
     fn render_files(

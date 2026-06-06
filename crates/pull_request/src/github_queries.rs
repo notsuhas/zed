@@ -363,6 +363,52 @@ pub fn create_pull_request() -> String {
     )
 }
 
+pub fn close_pull_request() -> &'static str {
+    r#"
+    mutation ClosePullRequest($pullRequestId: ID!) {
+      closePullRequest(input: { pullRequestId: $pullRequestId }) { pullRequest { id state } }
+    }
+    "#
+}
+
+pub fn reopen_pull_request() -> &'static str {
+    r#"
+    mutation ReopenPullRequest($pullRequestId: ID!) {
+      reopenPullRequest(input: { pullRequestId: $pullRequestId }) { pullRequest { id state } }
+    }
+    "#
+}
+
+pub fn ready_for_review() -> &'static str {
+    r#"
+    mutation ReadyForReview($pullRequestId: ID!) {
+      markPullRequestReadyForReview(input: { pullRequestId: $pullRequestId }) {
+        pullRequest { id isDraft }
+      }
+    }
+    "#
+}
+
+pub fn convert_to_draft() -> &'static str {
+    r#"
+    mutation ConvertToDraft($pullRequestId: ID!) {
+      convertPullRequestToDraft(input: { pullRequestId: $pullRequestId }) {
+        pullRequest { id isDraft }
+      }
+    }
+    "#
+}
+
+pub fn update_pull_request() -> &'static str {
+    r#"
+    mutation UpdatePullRequest($pullRequestId: ID!, $title: String, $body: String) {
+      updatePullRequest(input: { pullRequestId: $pullRequestId, title: $title, body: $body }) {
+        pullRequest { id title body }
+      }
+    }
+    "#
+}
+
 /// Fetch a file's text content at a commit. `$expression` is `<oid>:<path>`.
 /// `object` is null when the path doesn't exist at that revision (e.g. an
 /// added file has no base content).

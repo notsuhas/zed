@@ -1103,6 +1103,83 @@ impl PullRequestProvider for GitHubProvider {
         })
     }
 
+    fn close_pull_request<'a>(&'a self, pull_request_node_id: &'a str) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::close_pull_request(),
+                serde_json::json!({ "pullRequestId": pull_request_node_id }),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn reopen_pull_request<'a>(&'a self, pull_request_node_id: &'a str) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::reopen_pull_request(),
+                serde_json::json!({ "pullRequestId": pull_request_node_id }),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn mark_ready_for_review<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::ready_for_review(),
+                serde_json::json!({ "pullRequestId": pull_request_node_id }),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn convert_to_draft<'a>(&'a self, pull_request_node_id: &'a str) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::convert_to_draft(),
+                serde_json::json!({ "pullRequestId": pull_request_node_id }),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn update_pull_request<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        title: Option<&'a str>,
+        body: Option<&'a str>,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::update_pull_request(),
+                serde_json::json!({
+                    "pullRequestId": pull_request_node_id,
+                    "title": title,
+                    "body": body,
+                }),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
     fn merge_pull_request<'a>(
         &'a self,
         pull_request_node_id: &'a str,
