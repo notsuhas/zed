@@ -117,10 +117,15 @@ updates (e.g. viewed checkbox) revert on error.
 - [x] File status badges; open-on-GitHub; hide-viewed toggle
 - [x] Checkout PR branch
 
-Remaining stretch (not built):
-- [ ] Field pickers: labels / assignees / milestone / request-reviewers (need candidate-list popovers)
-- [ ] Auto-merge / merge queue
-- [ ] Single-comment vs batched-review toggle (currently posts immediately)
-- [ ] @mention / issue autocomplete; notifications view / tree badges
-- [ ] Syntax highlighting in the read-only fetched diff
+- [x] Field pickers: labels / assignees / milestone / request-reviewers (Edit-fields view)
+- [x] Auto-merge (enable)
+- [x] Batched review (start / route comments / submit / discard)
+- [x] @mention picker in the composer (insert @user)
+- [x] Notifications view (REST /notifications)
+- [x] Syntax highlighting in the read-only fetched diff
+- [x] Inline diff rendering (expand hunks + diff override); open-file highlight
+
+Remaining (minor / cosmetic):
+- [ ] Inline @mention type-ahead completion (needs editor CompletionProvider; picker shipped instead)
+- [ ] Merge queue; tree-view unread badges
 - [ ] Rename settings block review_panel → pull_request (cosmetic)
