@@ -5,6 +5,7 @@
 //! - `github_*` — the GitHub GraphQL implementation of that API.
 //! - `pull_request_panel` — the dock panel and its sub-views.
 
+mod diff_position;
 mod github_graphql;
 mod github_provider;
 mod github_queries;
