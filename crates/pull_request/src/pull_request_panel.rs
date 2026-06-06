@@ -838,6 +838,42 @@ impl PullRequestPanel {
             .color(if mergeable { Color::Success } else { Color::Warning })
         });
 
+        let meta = (!detail.assignees.is_empty() || detail.milestone.is_some()).then(|| {
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .when(!detail.assignees.is_empty(), |this| {
+                    this.child(
+                        Label::new(format!(
+                            "Assignees: {}",
+                            detail
+                                .assignees
+                                .iter()
+                                .map(|a| a.login.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                })
+                .when_some(detail.milestone.clone(), |this, milestone| {
+                    this.child(
+                        Label::new(format!("Milestone: {milestone}"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                })
+        });
+
+        let body = (!detail.body.is_empty()).then(|| {
+            v_flex().gap_0p5().p_1().child(
+                Label::new(detail.body.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+        });
+
         v_flex()
             .gap_1()
             .child(title_row)
@@ -847,9 +883,11 @@ impl PullRequestPanel {
                     .color(Color::Muted),
             )
             .when_some(labels, |this, labels| this.child(labels))
+            .when_some(meta, |this, meta| this.child(meta))
             .when_some(reviewers, |this, reviewers| this.child(reviewers))
             .when_some(checks, |this, checks| this.child(checks))
             .when_some(mergeable, |this, mergeable| this.child(mergeable))
+            .when_some(body, |this, body| this.child(body))
             .child(
                 h_flex()
                     .gap_1()
