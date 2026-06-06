@@ -105,12 +105,22 @@ updates (e.g. viewed checkbox) revert on error.
 - [x] Timeline / activity
 - [x] Diff-position mapping (line + hunk based) with tests
 
-Remaining toward full parity (not yet built):
-- [ ] Open file diff in the multibuffer + render threads inline at mapped rows
-- [ ] Comment edit/delete; add-reaction (write); single-comment vs batched review toggle
-- [ ] Suggested changes: render + apply
-- [ ] Create PR flow (provider method exists; no form UI yet)
-- [ ] Edit title/body/labels/assignees/milestone; request reviewers; close/reopen/draft
-- [ ] Auto-merge / merge queue; choose merge method
-- [ ] @mention / issue autocomplete; notifications / badges (stretch)
+- [x] Open file diff (read-only fetched base↔head, or editable working-tree file when checked out)
+- [x] Render threads inline in the diff at mapped rows
+- [x] Add comment on a line (AddComment action); reply; edit; delete
+- [x] Add/remove reactions
+- [x] Suggested changes: render + apply + make-suggestion
+- [x] Create PR flow (form)
+- [x] Edit title/body
+- [x] Close/reopen; draft toggle; merge method choice (merge/squash/rebase)
+- [x] List free-text search (covers ad-hoc qualifiers)
+- [x] File status badges; open-on-GitHub; hide-viewed toggle
+- [x] Checkout PR branch
+
+Remaining stretch (not built):
+- [ ] Field pickers: labels / assignees / milestone / request-reviewers (need candidate-list popovers)
+- [ ] Auto-merge / merge queue
+- [ ] Single-comment vs batched-review toggle (currently posts immediately)
+- [ ] @mention / issue autocomplete; notifications view / tree badges
+- [ ] Syntax highlighting in the read-only fetched diff
 - [ ] Rename settings block review_panel → pull_request (cosmetic)
