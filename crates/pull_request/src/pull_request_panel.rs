@@ -485,9 +485,13 @@ impl PullRequestPanel {
         .detach();
     }
 
-    /// Fetch a file's base+head content from GitHub and open a read-only diff
-    /// in the workspace center pane (matching the VS Code extension, which
-    /// diffs API-fetched blob text rather than the local checkout).
+    /// Open a file's diff in the center pane.
+    ///
+    /// Matching the VS Code extension: when the PR's head branch is the branch
+    /// checked out locally, open the real working-tree file (editable) diffed
+    /// against the PR base content (so edits save to disk and the diff spans
+    /// base → working tree). Otherwise open a read-only base↔head diff of the
+    /// API-fetched blob text (works for forks / un-fetched heads).
     fn open_file_diff(&mut self, path: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
             return;
@@ -497,8 +501,18 @@ impl PullRequestPanel {
         let repo = info.id.repo.to_string();
         let base_sha = info.base_sha.to_string();
         let head_sha = info.head_sha.to_string();
+        let head_ref = info.head_ref.to_string();
         let project = self.project.clone();
         let workspace = self.workspace.clone();
+
+        // Is the PR's head branch the one checked out in the local repo? If so,
+        // resolve its working directory so we can open the real file.
+        let local_root = self.active_repository.as_ref().and_then(|repo| {
+            let repo = repo.read(cx);
+            let branch = repo.branch.as_ref()?;
+            let current = branch.ref_name.trim_start_matches("refs/heads/");
+            (current == head_ref).then(|| repo.work_directory_abs_path.clone())
+        });
 
         cx.spawn_in(window, async move |_this, cx| {
             let base = provider
@@ -506,38 +520,36 @@ impl PullRequestPanel {
                 .await
                 .unwrap_or(None)
                 .unwrap_or_default();
+
+            // Try the editable local-file path when the PR is checked out.
+            if let Some(root) = local_root {
+                let abs_path = root.join(std::path::Path::new(path.as_ref()));
+                let project_path = project.read_with(cx, |project, cx| {
+                    project.project_path_for_absolute_path(&abs_path, cx)
+                });
+                if let Some(project_path) = project_path {
+                    let buffer = project
+                        .update(cx, |project, cx| project.open_buffer(project_path, cx))
+                        .await?;
+                    workspace
+                        .update_in(cx, |workspace, window, cx| {
+                            open_diff_item(buffer, base.as_ref(), false, &project, workspace, window, cx);
+                        })
+                        .ok();
+                    return anyhow::Ok(());
+                }
+            }
+
+            // Fallback: read-only diff of fetched head content.
             let head = provider
                 .fetch_file_content(&owner, &repo, &format!("{head_sha}:{path}"))
                 .await
                 .unwrap_or(None)
                 .unwrap_or_default();
-
             workspace
                 .update_in(cx, |workspace, window, cx| {
                     let head_buffer = cx.new(|cx| Buffer::local(head.to_string(), cx));
-                    let snapshot = head_buffer.read(cx).snapshot();
-                    let diff = cx.new(|cx| BufferDiff::new(&snapshot.text, cx));
-                    diff.update(cx, |diff, cx| {
-                        // Diff computes asynchronously; the editor re-renders when ready.
-                        let _ = diff.set_base_text(
-                            Some(std::sync::Arc::from(base.as_ref())),
-                            None,
-                            snapshot.text.clone(),
-                            cx,
-                        );
-                    });
-                    let multibuffer = cx.new(|cx| {
-                        let mut multibuffer = MultiBuffer::singleton(head_buffer.clone(), cx);
-                        multibuffer.add_diff(diff, cx);
-                        multibuffer
-                    });
-                    let editor = cx.new(|cx| {
-                        let mut editor =
-                            Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx);
-                        editor.set_read_only(true);
-                        editor
-                    });
-                    workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
+                    open_diff_item(head_buffer, base.as_ref(), true, &project, workspace, window, cx);
                 })
                 .ok();
             anyhow::Ok(())
@@ -1234,6 +1246,44 @@ fn to_toggle(checked: bool) -> ToggleState {
     } else {
         ToggleState::Unselected
     }
+}
+
+/// Build a base↔buffer diff editor and add it to the active pane. The buffer
+/// is the modified (right) side; `base_text` is the read-only original (left).
+fn open_diff_item(
+    buffer: Entity<Buffer>,
+    base_text: &str,
+    read_only: bool,
+    project: &Entity<Project>,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let snapshot = buffer.read(cx).snapshot();
+    let language = buffer.read(cx).language().cloned();
+    let diff = cx.new(|cx| BufferDiff::new(&snapshot.text, cx));
+    diff.update(cx, |diff, cx| {
+        // Diff computes asynchronously; the editor re-renders when it lands.
+        let _ = diff.set_base_text(
+            Some(std::sync::Arc::from(base_text)),
+            language,
+            snapshot.text.clone(),
+            cx,
+        );
+    });
+    let multibuffer = cx.new(|cx| {
+        let mut multibuffer = MultiBuffer::singleton(buffer, cx);
+        multibuffer.add_diff(diff, cx);
+        multibuffer
+    });
+    let editor = cx.new(|cx| {
+        let mut editor = Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx);
+        if read_only {
+            editor.set_read_only(true);
+        }
+        editor
+    });
+    workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
 }
 
 /// Icon/color/label for an aggregate CI status.
