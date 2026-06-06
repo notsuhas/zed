@@ -132,6 +132,7 @@ pub struct PullRequestPanel {
     detail_loading: bool,
     file_layout: FileLayout,
     hide_viewed: bool,
+    open_file_path: Option<SharedString>,
     collapsed_dirs: HashSet<String>,
     comment_editor: Entity<Editor>,
     composer_target: Option<ComposerTarget>,
@@ -257,6 +258,7 @@ impl PullRequestPanel {
             detail_loading: false,
             file_layout: FileLayout::Tree,
             hide_viewed: false,
+            open_file_path: None,
             collapsed_dirs: HashSet::new(),
             comment_editor,
             composer_target: None,
@@ -837,6 +839,7 @@ impl PullRequestPanel {
         let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
             return;
         };
+        self.open_file_path = Some(path.clone());
         let info = &loaded.detail.info;
         let owner = info.id.owner.to_string();
         let repo = info.id.repo.to_string();
@@ -1703,6 +1706,7 @@ impl PullRequestPanel {
         let path = file.path.clone();
         let open_path = file.path.clone();
         let github_path = file.path.clone();
+        let is_open = self.open_file_path.as_ref() == Some(&file.path);
         let (badge, badge_color) = file_status_badge(&file.status);
         h_flex()
             .w_full()
@@ -1710,6 +1714,7 @@ impl PullRequestPanel {
             .pl(px(8.0 + depth as f32 * 12.0))
             .pr_2()
             .gap_1()
+            .when(is_open, |this| this.bg(cx.theme().colors().element_selected))
             .child(
                 Checkbox::new(
                     SharedString::from(format!("viewed:{path}")),
@@ -2208,10 +2213,14 @@ fn open_diff_item(
     let multibuffer = cx.new(|cx| {
         let mut multibuffer = MultiBuffer::singleton(buffer, cx);
         multibuffer.add_diff(diff, cx);
+        // Expand all hunks so removed lines render inline, not just in the gutter.
+        multibuffer.set_all_diff_hunks_expanded(cx);
         multibuffer
     });
     let editor = cx.new(|cx| {
         let mut editor = Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx);
+        // Render the editor as a diff (base ↔ buffer) rather than a plain file.
+        editor.start_temporary_diff_override();
         if read_only {
             editor.set_read_only(true);
         }
