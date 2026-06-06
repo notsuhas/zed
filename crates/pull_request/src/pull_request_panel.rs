@@ -529,6 +529,56 @@ impl PullRequestPanel {
         .detach();
     }
 
+    /// Apply a ```suggestion block to the working-tree file over the thread's
+    /// line range. Requires the PR branch to be checked out locally.
+    fn apply_suggestion(
+        &mut self,
+        path: SharedString,
+        start_line: u32,
+        end_line: u32,
+        suggestion: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(loaded) = self.selected.as_ref() else {
+            return;
+        };
+        let head_ref = loaded.detail.info.head_ref.to_string();
+        let Some(root) = self.active_repository.as_ref().and_then(|repo| {
+            let repo = repo.read(cx);
+            let branch = repo.branch.as_ref()?;
+            (branch.ref_name.trim_start_matches("refs/heads/") == head_ref)
+                .then(|| repo.work_directory_abs_path.clone())
+        }) else {
+            self.detail_error =
+                Some("Apply needs the PR branch checked out locally".into());
+            cx.notify();
+            return;
+        };
+        let abs_path = root.join(std::path::Path::new(path.as_ref()));
+        let project = self.project.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let project_path = project.read_with(cx, |project, cx| {
+                project.project_path_for_absolute_path(&abs_path, cx)
+            });
+            let Some(project_path) = project_path else {
+                return anyhow::Ok(());
+            };
+            let buffer = project
+                .update(cx, |project, cx| project.open_buffer(project_path, cx))
+                .await?;
+            buffer.update(cx, |buffer, cx| {
+                let start = Point::new(start_line.saturating_sub(1), 0);
+                let end_row = end_line.saturating_sub(1).min(buffer.max_point().row);
+                let end = Point::new(end_row, buffer.line_len(end_row));
+                buffer.edit([(start..end, suggestion)], None, cx);
+            });
+            this.update(cx, |_this, cx| cx.notify()).ok();
+            anyhow::Ok(())
+        })
+        .detach();
+    }
+
     fn delete_comment(&mut self, comment_database_id: u64, cx: &mut Context<Self>) {
         let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
             return;
@@ -1270,6 +1320,60 @@ impl PullRequestPanel {
 
     fn render_thread(&self, thread: &ReviewThread, cx: &Context<Self>) -> impl IntoElement {
         let thread_id = thread.id.clone();
+        // Suggestions parsed from this thread's comments (right-side only — they
+        // apply to the working tree).
+        let suggestion_texts: Vec<String> = if thread.diff_side == DiffSide::Right {
+            thread
+                .comments
+                .iter()
+                .flat_map(|comment| parse_suggestions(&comment.body))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let suggestion_path = thread.path.clone();
+        let end_line = thread.line.unwrap_or(1);
+        let start_line = thread.start_line.unwrap_or(end_line);
+        let suggestions = (!suggestion_texts.is_empty()).then(|| {
+            let suggestion_thread_id = thread_id.clone();
+            let suggestion_path = suggestion_path.clone();
+            v_flex()
+                .gap_1()
+                .children(suggestion_texts.iter().cloned().enumerate().map(
+                    move |(index, suggestion)| {
+                        let path = suggestion_path.clone();
+                        let text = suggestion.clone();
+                        v_flex()
+                            .gap_0p5()
+                            .p_1()
+                            .child(
+                                Label::new(suggestion)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Created),
+                            )
+                            .child(
+                                Button::new(
+                                    SharedString::from(format!(
+                                        "apply:{suggestion_thread_id}:{index}"
+                                    )),
+                                    "Apply suggestion",
+                                )
+                                .label_size(LabelSize::XSmall)
+                                .style(ButtonStyle::Filled)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.apply_suggestion(
+                                        path.clone(),
+                                        start_line,
+                                        end_line,
+                                        text.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                            )
+                    },
+                ))
+        });
         let location = format!(
             "{}{}",
             thread.path,
@@ -1346,6 +1450,7 @@ impl PullRequestPanel {
             .p_1()
             .child(header)
             .children(thread.comments.iter().map(|comment| self.render_comment(comment, cx)))
+            .when_some(suggestions, |this, suggestions| this.child(suggestions))
             .when(is_replying, |this| this.child(self.render_composer(cx)))
     }
 
@@ -1464,6 +1569,14 @@ impl PullRequestPanel {
                             ),
                     )
                     .child(
+                        Button::new("make-suggestion", "Suggest")
+                            .label_size(LabelSize::XSmall)
+                            .tooltip(Tooltip::text("Wrap the comment in a suggestion block"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.wrap_suggestion(window, cx)
+                            })),
+                    )
+                    .child(
                         Button::new("cancel-comment", "Cancel")
                             .label_size(LabelSize::XSmall)
                             .on_click(cx.listener(|this, _, _window, cx| {
@@ -1473,6 +1586,34 @@ impl PullRequestPanel {
                     ),
             )
     }
+
+    /// Wrap the composer's current text in a ```suggestion fence.
+    fn wrap_suggestion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let body = self.comment_editor.read(cx).text(cx);
+        let wrapped = format!("```suggestion\n{}\n```", body.trim_end());
+        self.comment_editor
+            .update(cx, |editor, cx| editor.set_text(wrapped, window, cx));
+        cx.notify();
+    }
+}
+
+/// Extract the contents of ```suggestion fenced blocks from a comment body.
+fn parse_suggestions(body: &str) -> Vec<String> {
+    let mut suggestions = Vec::new();
+    let mut lines = body.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_start().starts_with("```suggestion") {
+            let mut block = Vec::new();
+            for line in lines.by_ref() {
+                if line.trim_start().starts_with("```") {
+                    break;
+                }
+                block.push(line);
+            }
+            suggestions.push(block.join("\n"));
+        }
+    }
+    suggestions
 }
 
 /// Map a GitHub reaction content enum to an emoji.
@@ -1778,5 +1919,17 @@ mod tests {
             ("zed-industries".to_string(), "zed".to_string())
         );
         assert!(parse_github_remote("git@gitlab.com:foo/bar.git").is_err());
+    }
+
+    #[test]
+    fn parses_suggestion_blocks() {
+        let body = "Looks good but:\n```suggestion\nlet x = 1;\nlet y = 2;\n```\nthanks";
+        let suggestions = parse_suggestions(body);
+        assert_eq!(suggestions, vec!["let x = 1;\nlet y = 2;".to_string()]);
+
+        assert!(parse_suggestions("no suggestion here").is_empty());
+
+        let multi = "```suggestion\na\n```\nand\n```suggestion\nb\n```";
+        assert_eq!(parse_suggestions(multi), vec!["a".to_string(), "b".to_string()]);
     }
 }
