@@ -136,6 +136,8 @@ pub struct PullRequestPanel {
     collapsed_dirs: HashSet<String>,
     comment_editor: Entity<Editor>,
     composer_target: Option<ComposerTarget>,
+    /// Active pending-review batch id, if the user started a review.
+    pending_review: Option<SharedString>,
     create_title: Entity<Editor>,
     create_body: Entity<Editor>,
     create_base: Entity<Editor>,
@@ -262,6 +264,7 @@ impl PullRequestPanel {
             collapsed_dirs: HashSet::new(),
             comment_editor,
             composer_target: None,
+            pending_review: None,
             create_title,
             create_body,
             create_base,
@@ -633,7 +636,7 @@ impl PullRequestPanel {
             pull_request,
             body: body.into(),
             target: comment_target,
-            review_id: None,
+            review_id: self.pending_review.clone(),
             commit_sha,
         };
         cx.spawn(async move |this, cx| {
@@ -1061,6 +1064,45 @@ impl PullRequestPanel {
         }
     }
 
+    fn start_review_batch(&mut self, cx: &mut Context<Self>) {
+        let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
+            return;
+        };
+        let node_id = loaded.detail.info.id.node_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = provider.start_review(&node_id).await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(review_id) => this.pending_review = Some(review_id),
+                    Err(error) => this.detail_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn discard_review(&mut self, cx: &mut Context<Self>) {
+        let (Some(provider), Some(review_id)) =
+            (self.provider.clone(), self.pending_review.take())
+        else {
+            return;
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = provider.delete_review(&review_id).await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.detail_error = Some(error.to_string().into());
+                }
+                this.refresh_threads(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn submit_review(&mut self, event: ReviewEvent, cx: &mut Context<Self>) {
         let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
             return;
@@ -1070,12 +1112,16 @@ impl PullRequestPanel {
         let repo = info.id.repo.to_string();
         let node_id = info.id.node_id.to_string();
         let number = info.id.number;
+        // Prefer the locally-started batch, then a server pending review, else start one.
+        let pending = self.pending_review.take();
         cx.spawn(async move |this, cx| {
-            // Reuse a pending review if one exists, otherwise start a fresh one.
-            let review_id = match provider.pending_review_id(&owner, &repo, number).await {
-                Ok(Some(id)) => Ok(id),
-                Ok(None) => provider.start_review(&node_id).await,
-                Err(error) => Err(error),
+            let review_id = match pending {
+                Some(id) => Ok(id),
+                None => match provider.pending_review_id(&owner, &repo, number).await {
+                    Ok(Some(id)) => Ok(id),
+                    Ok(None) => provider.start_review(&node_id).await,
+                    Err(error) => Err(error),
+                },
             };
             let result = match review_id {
                 Ok(review_id) => provider.submit_review(&review_id, event, "").await,
@@ -1085,7 +1131,7 @@ impl PullRequestPanel {
                 if let Err(error) = result {
                     this.detail_error = Some(error.to_string().into());
                 }
-                cx.notify();
+                this.refresh_threads(cx);
             })
             .ok();
         })
@@ -1366,6 +1412,7 @@ impl PullRequestPanel {
         let detail = &loaded.detail;
         let info = &detail.info;
         let is_checked_out = self.pr_is_checked_out(cx);
+        let reviewing = self.pending_review.is_some();
 
         let state_label = match info.state {
             PullRequestState::Open if info.is_draft => ("Draft", Color::Muted),
@@ -1500,6 +1547,20 @@ impl PullRequestPanel {
                             .on_click(cx.listener(|this, _, _window, cx| {
                                 this.submit_review(ReviewEvent::Comment, cx)
                             })),
+                    )
+                    .child(
+                        Button::new(
+                            "start-review",
+                            if reviewing { "Discard review" } else { "Start review" },
+                        )
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            if this.pending_review.is_some() {
+                                this.discard_review(cx);
+                            } else {
+                                this.start_review_batch(cx);
+                            }
+                        })),
                     )
                     .when(!is_checked_out, |this| {
                         this.child(
