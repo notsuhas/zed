@@ -923,6 +923,40 @@ impl PullRequestPanel {
         .detach();
     }
 
+    /// Whether the selected PR's head branch is the locally checked-out branch.
+    fn pr_is_checked_out(&self, cx: &App) -> bool {
+        let (Some(repo), Some(loaded)) = (self.active_repository.as_ref(), self.selected.as_ref())
+        else {
+            return false;
+        };
+        let head_ref = &loaded.detail.info.head_ref;
+        repo.read(cx)
+            .branch
+            .as_ref()
+            .map(|branch| branch.ref_name.trim_start_matches("refs/heads/") == head_ref.as_ref())
+            .unwrap_or(false)
+    }
+
+    fn checkout_pr(&mut self, cx: &mut Context<Self>) {
+        let (Some(repo), Some(loaded)) = (self.active_repository.clone(), self.selected.as_ref())
+        else {
+            return;
+        };
+        let head = loaded.detail.info.head_ref.to_string();
+        cx.spawn(async move |this, cx| {
+            let receiver = repo.update(cx, |repo, _cx| repo.change_branch(head));
+            let result = receiver.await.unwrap_or_else(|_| Ok(()));
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.detail_error = Some(error.to_string().into());
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn close_or_reopen(&mut self, cx: &mut Context<Self>) {
         let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
             return;
@@ -1299,6 +1333,7 @@ impl PullRequestPanel {
     ) -> impl IntoElement {
         let detail = &loaded.detail;
         let info = &detail.info;
+        let is_checked_out = self.pr_is_checked_out(cx);
 
         let state_label = match info.state {
             PullRequestState::Open if info.is_draft => ("Draft", Color::Muted),
@@ -1434,6 +1469,15 @@ impl PullRequestPanel {
                                 this.submit_review(ReviewEvent::Comment, cx)
                             })),
                     )
+                    .when(!is_checked_out, |this| {
+                        this.child(
+                            Button::new("checkout", "Checkout")
+                                .label_size(LabelSize::Small)
+                                .on_click(
+                                    cx.listener(|this, _, _window, cx| this.checkout_pr(cx)),
+                                ),
+                        )
+                    })
                     .when(
                         detail.viewer_can_merge
                             && info.state == PullRequestState::Open
