@@ -615,7 +615,7 @@ impl PullRequestPanel {
             .items_start()
             .hover(|style| style.bg(cx.theme().colors().element_hover))
             .cursor_pointer()
-            .child(Icon::new(IconName::GitBranch).size(IconSize::Small).color(state_color))
+            .child(Icon::new(IconName::PullRequest).size(IconSize::Small).color(state_color))
             .child(
                 v_flex()
                     .gap_0p5()
@@ -1207,7 +1207,7 @@ impl Panel for PullRequestPanel {
     }
 
     fn icon(&self, _window: &Window, cx: &App) -> Option<IconName> {
-        Some(IconName::GitBranch).filter(|_| ReviewPanelSettings::get_global(cx).button)
+        Some(IconName::PullRequest).filter(|_| ReviewPanelSettings::get_global(cx).button)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
