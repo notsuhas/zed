@@ -308,6 +308,13 @@ pub struct NewComment {
     pub commit_sha: SharedString,
 }
 
+/// A selectable candidate (label, user, milestone) with its node id + display.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Candidate {
+    pub id: SharedString,
+    pub name: SharedString,
+}
+
 /// Inputs for creating a pull request.
 #[derive(Clone, Debug)]
 pub struct CreatePullRequest {
@@ -449,6 +456,69 @@ pub trait PullRequestProvider: Send + Sync {
         &'a self,
         subject_node_id: &'a str,
         content: &'a str,
+    ) -> ProviderFuture<'a, ()>;
+
+    /// Candidate labels for the repo.
+    fn fetch_labels<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+    ) -> ProviderFuture<'a, Vec<Candidate>>;
+
+    /// Candidate assignable users for the repo (also used for reviewers).
+    fn fetch_assignable_users<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+    ) -> ProviderFuture<'a, Vec<Candidate>>;
+
+    /// Candidate open milestones for the repo.
+    fn fetch_milestones<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+    ) -> ProviderFuture<'a, Vec<Candidate>>;
+
+    /// Add labels to a pull request.
+    fn add_labels<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        label_ids: Vec<String>,
+    ) -> ProviderFuture<'a, ()>;
+
+    /// Remove labels from a pull request.
+    fn remove_labels<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        label_ids: Vec<String>,
+    ) -> ProviderFuture<'a, ()>;
+
+    /// Add assignees to a pull request.
+    fn add_assignees<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        user_ids: Vec<String>,
+    ) -> ProviderFuture<'a, ()>;
+
+    /// Remove assignees from a pull request.
+    fn remove_assignees<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        user_ids: Vec<String>,
+    ) -> ProviderFuture<'a, ()>;
+
+    /// Set (or clear) a pull request's milestone.
+    fn set_milestone<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        milestone_id: Option<String>,
+    ) -> ProviderFuture<'a, ()>;
+
+    /// Replace a pull request's requested reviewers.
+    fn request_reviewers<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        user_ids: Vec<String>,
     ) -> ProviderFuture<'a, ()>;
 
     /// Enable auto-merge with the given method.

@@ -31,6 +31,54 @@ impl GitHubProvider {
     fn token(&self) -> Option<&str> {
         self.token.as_deref()
     }
+
+    /// Run a mutation of the shape `{ <id_key>: id, <list_key>: [ids] }`.
+    fn run_id_list_mutation<'a>(
+        &'a self,
+        query: &'static str,
+        id_key: &'static str,
+        id: &'a str,
+        list_key: &'static str,
+        ids: Vec<String>,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let mut vars = serde_json::Map::new();
+            vars.insert(id_key.to_string(), serde_json::Value::String(id.to_string()));
+            vars.insert(
+                list_key.to_string(),
+                serde_json::Value::Array(ids.into_iter().map(serde_json::Value::String).collect()),
+            );
+            let _: serde_json::Value =
+                execute(&self.http_client, self.token(), query, serde_json::Value::Object(vars))
+                    .await?;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct NamedNode {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    login: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+impl NamedNode {
+    fn into_candidate(self) -> Candidate {
+        Candidate {
+            id: self.id.into(),
+            name: self
+                .name
+                .or(self.login)
+                .or(self.title)
+                .unwrap_or_default()
+                .into(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,6 +1149,160 @@ impl PullRequestProvider for GitHubProvider {
             .await?;
             Ok(())
         })
+    }
+
+    fn fetch_labels<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+    ) -> ProviderFuture<'a, Vec<Candidate>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Data {
+                repository: Conn,
+            }
+            #[derive(Deserialize)]
+            struct Conn {
+                labels: GqlNodes<NamedNode>,
+            }
+            let data: Data = execute(
+                &self.http_client,
+                self.token(),
+                q::repo_labels(),
+                serde_json::json!({ "owner": owner, "name": repo }),
+            )
+            .await?;
+            Ok(data.repository.labels.nodes.into_iter().map(NamedNode::into_candidate).collect())
+        })
+    }
+
+    fn fetch_assignable_users<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+    ) -> ProviderFuture<'a, Vec<Candidate>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Data {
+                repository: Conn,
+            }
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Conn {
+                assignable_users: GqlNodes<NamedNode>,
+            }
+            let data: Data = execute(
+                &self.http_client,
+                self.token(),
+                q::assignable_users(),
+                serde_json::json!({ "owner": owner, "name": repo }),
+            )
+            .await?;
+            Ok(data
+                .repository
+                .assignable_users
+                .nodes
+                .into_iter()
+                .map(NamedNode::into_candidate)
+                .collect())
+        })
+    }
+
+    fn fetch_milestones<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+    ) -> ProviderFuture<'a, Vec<Candidate>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Data {
+                repository: Conn,
+            }
+            #[derive(Deserialize)]
+            struct Conn {
+                milestones: GqlNodes<NamedNode>,
+            }
+            let data: Data = execute(
+                &self.http_client,
+                self.token(),
+                q::repo_milestones(),
+                serde_json::json!({ "owner": owner, "name": repo }),
+            )
+            .await?;
+            Ok(data
+                .repository
+                .milestones
+                .nodes
+                .into_iter()
+                .map(NamedNode::into_candidate)
+                .collect())
+        })
+    }
+
+    fn add_labels<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        label_ids: Vec<String>,
+    ) -> ProviderFuture<'a, ()> {
+        self.run_id_list_mutation(q::add_labels(), "labelableId", pull_request_node_id, "labelIds", label_ids)
+    }
+
+    fn remove_labels<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        label_ids: Vec<String>,
+    ) -> ProviderFuture<'a, ()> {
+        self.run_id_list_mutation(q::remove_labels(), "labelableId", pull_request_node_id, "labelIds", label_ids)
+    }
+
+    fn add_assignees<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        user_ids: Vec<String>,
+    ) -> ProviderFuture<'a, ()> {
+        self.run_id_list_mutation(q::add_assignees(), "assignableId", pull_request_node_id, "assigneeIds", user_ids)
+    }
+
+    fn remove_assignees<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        user_ids: Vec<String>,
+    ) -> ProviderFuture<'a, ()> {
+        self.run_id_list_mutation(q::remove_assignees(), "assignableId", pull_request_node_id, "assigneeIds", user_ids)
+    }
+
+    fn set_milestone<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        milestone_id: Option<String>,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::set_milestone(),
+                serde_json::json!({
+                    "pullRequestId": pull_request_node_id,
+                    "milestoneId": milestone_id,
+                }),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn request_reviewers<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        user_ids: Vec<String>,
+    ) -> ProviderFuture<'a, ()> {
+        self.run_id_list_mutation(
+            q::request_reviewers(),
+            "pullRequestId",
+            pull_request_node_id,
+            "userIds",
+            user_ids,
+        )
     }
 
     fn enable_auto_merge<'a>(

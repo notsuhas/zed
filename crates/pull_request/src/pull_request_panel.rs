@@ -106,6 +106,7 @@ enum ActiveView {
     List,
     Detail,
     Create,
+    Fields,
 }
 
 pub struct PullRequestPanel {
@@ -147,6 +148,9 @@ pub struct PullRequestPanel {
     /// When set, the Create view edits this existing PR's title/body instead of
     /// creating a new one.
     edit_target: Option<SharedString>,
+    repo_labels: Vec<Candidate>,
+    repo_users: Vec<Candidate>,
+    repo_milestones: Vec<Candidate>,
     search_editor: Entity<Editor>,
     _refresh_task: Option<Task<()>>,
     _detail_task: Option<Task<()>>,
@@ -272,6 +276,9 @@ impl PullRequestPanel {
             create_draft: false,
             create_error: None,
             edit_target: None,
+            repo_labels: Vec::new(),
+            repo_users: Vec::new(),
+            repo_milestones: Vec::new(),
             search_editor,
             _refresh_task: None,
             _detail_task: None,
@@ -972,6 +979,139 @@ impl PullRequestPanel {
         .detach();
     }
 
+    fn open_fields(&mut self, cx: &mut Context<Self>) {
+        let (Some(provider), Some(owner), Some(repo)) =
+            (self.provider.clone(), self.owner.clone(), self.repo.clone())
+        else {
+            return;
+        };
+        self.active_view = ActiveView::Fields;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let labels = provider.fetch_labels(&owner, &repo).await.unwrap_or_default();
+            let users = provider
+                .fetch_assignable_users(&owner, &repo)
+                .await
+                .unwrap_or_default();
+            let milestones = provider
+                .fetch_milestones(&owner, &repo)
+                .await
+                .unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.repo_labels = labels;
+                this.repo_users = users;
+                this.repo_milestones = milestones;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn pr_node_id(&self) -> Option<String> {
+        self.selected
+            .as_ref()
+            .map(|loaded| loaded.detail.info.id.node_id.to_string())
+    }
+
+    fn toggle_label(&mut self, label_id: SharedString, currently_on: bool, cx: &mut Context<Self>) {
+        let (Some(provider), Some(node_id)) = (self.provider.clone(), self.pr_node_id()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let ids = vec![label_id.to_string()];
+            let result = if currently_on {
+                provider.remove_labels(&node_id, ids).await
+            } else {
+                provider.add_labels(&node_id, ids).await
+            };
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.detail_error = Some(error.to_string().into());
+                }
+                this.refresh_detail(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn toggle_assignee(&mut self, user_id: SharedString, currently_on: bool, cx: &mut Context<Self>) {
+        let (Some(provider), Some(node_id)) = (self.provider.clone(), self.pr_node_id()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let ids = vec![user_id.to_string()];
+            let result = if currently_on {
+                provider.remove_assignees(&node_id, ids).await
+            } else {
+                provider.add_assignees(&node_id, ids).await
+            };
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.detail_error = Some(error.to_string().into());
+                }
+                this.refresh_detail(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_milestone_id(&mut self, milestone_id: Option<SharedString>, cx: &mut Context<Self>) {
+        let (Some(provider), Some(node_id)) = (self.provider.clone(), self.pr_node_id()) else {
+            return;
+        };
+        let id = milestone_id.map(|id| id.to_string());
+        cx.spawn(async move |this, cx| {
+            let result = provider.set_milestone(&node_id, id).await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.detail_error = Some(error.to_string().into());
+                }
+                this.refresh_detail(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Toggle a requested reviewer by recomputing the full requested set.
+    fn toggle_reviewer(&mut self, user_id: SharedString, currently_on: bool, cx: &mut Context<Self>) {
+        let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
+            return;
+        };
+        let node_id = loaded.detail.info.id.node_id.to_string();
+        let mut ids: Vec<String> = loaded
+            .detail
+            .reviewers
+            .iter()
+            .filter_map(|reviewer| {
+                self.repo_users
+                    .iter()
+                    .find(|candidate| candidate.name == reviewer.actor.login)
+                    .map(|candidate| candidate.id.to_string())
+            })
+            .collect();
+        let target = user_id.to_string();
+        if currently_on {
+            ids.retain(|id| id != &target);
+        } else if !ids.contains(&target) {
+            ids.push(target);
+        }
+        cx.spawn(async move |this, cx| {
+            let result = provider.request_reviewers(&node_id, ids).await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.detail_error = Some(error.to_string().into());
+                }
+                this.refresh_detail(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn close_or_reopen(&mut self, cx: &mut Context<Self>) {
         let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
             return;
@@ -1266,6 +1406,127 @@ impl PullRequestPanel {
             .on_click(cx.listener(move |this, _, _window, cx| {
                 this.select_pull_request(pr.clone(), cx)
             }))
+    }
+
+    fn render_fields(&self, cx: &Context<Self>) -> impl IntoElement {
+        let header = h_flex()
+            .gap_1()
+            .p_2()
+            .child(
+                IconButton::new("fields-back", IconName::ArrowLeft)
+                    .tooltip(Tooltip::text("Back"))
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.active_view = ActiveView::Detail;
+                        cx.notify();
+                    })),
+            )
+            .child(Label::new("Edit fields").size(LabelSize::Small));
+
+        let current_labels: HashSet<SharedString> = self
+            .selected
+            .as_ref()
+            .map(|l| l.detail.labels.iter().cloned().collect())
+            .unwrap_or_default();
+        let current_assignees: HashSet<SharedString> = self
+            .selected
+            .as_ref()
+            .map(|l| l.detail.assignees.iter().map(|a| a.login.clone()).collect())
+            .unwrap_or_default();
+        let current_reviewers: HashSet<SharedString> = self
+            .selected
+            .as_ref()
+            .map(|l| {
+                l.detail
+                    .reviewers
+                    .iter()
+                    .map(|r| r.actor.login.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let current_milestone = self
+            .selected
+            .as_ref()
+            .and_then(|l| l.detail.milestone.clone());
+
+        let section = |title: &str, body: gpui::AnyElement| {
+            v_flex()
+                .gap_0p5()
+                .child(Label::new(title.to_string()).size(LabelSize::Small))
+                .child(body)
+        };
+
+        let labels = self.repo_candidate_toggles(
+            "label",
+            &self.repo_labels,
+            &current_labels,
+            |this, id, on, cx| this.toggle_label(id, on, cx),
+            cx,
+        );
+        let reviewers = self.repo_candidate_toggles(
+            "reviewer",
+            &self.repo_users,
+            &current_reviewers,
+            |this, id, on, cx| this.toggle_reviewer(id, on, cx),
+            cx,
+        );
+        let assignees = self.repo_candidate_toggles(
+            "assignee",
+            &self.repo_users,
+            &current_assignees,
+            |this, id, on, cx| this.toggle_assignee(id, on, cx),
+            cx,
+        );
+        let milestones = v_flex().gap_0p5().children(self.repo_milestones.iter().map(|m| {
+            let on = current_milestone.as_ref() == Some(&m.name);
+            let id = m.id.clone();
+            h_flex()
+                .gap_1()
+                .child(Checkbox::new(SharedString::from(format!("ms:{id}")), to_toggle(on)).on_click(
+                    cx.listener(move |this, _, _window, cx| {
+                        this.set_milestone_id(if on { None } else { Some(id.clone()) }, cx)
+                    }),
+                ))
+                .child(Label::new(m.name.clone()).size(LabelSize::Small))
+        }));
+
+        v_flex().size_full().child(header).child(
+            v_flex()
+                .id("fields-body")
+                .overflow_y_scroll()
+                .gap_2()
+                .p_2()
+                .child(section("Labels", labels.into_any_element()))
+                .child(section("Reviewers", reviewers.into_any_element()))
+                .child(section("Assignees", assignees.into_any_element()))
+                .child(section("Milestone", milestones.into_any_element())),
+        )
+    }
+
+    /// A checkbox list over candidates, calling `toggle(this, id, currently_on)`.
+    fn repo_candidate_toggles(
+        &self,
+        kind: &'static str,
+        candidates: &[Candidate],
+        current: &HashSet<SharedString>,
+        toggle: impl Fn(&mut Self, SharedString, bool, &mut Context<Self>) + Copy + 'static,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        v_flex().gap_0p5().children(candidates.iter().map(|candidate| {
+            let on = current.contains(&candidate.name);
+            let id = candidate.id.clone();
+            h_flex()
+                .gap_1()
+                .child(
+                    Checkbox::new(
+                        SharedString::from(format!("{kind}:{id}")),
+                        to_toggle(on),
+                    )
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        toggle(this, id.clone(), on, cx)
+                    })),
+                )
+                .child(Label::new(candidate.name.clone()).size(LabelSize::Small))
+        }))
     }
 
     fn render_create(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1614,6 +1875,13 @@ impl PullRequestPanel {
                                 .label_size(LabelSize::Small)
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.start_edit_pr(window, cx)),
+                                ),
+                        )
+                        .child(
+                            Button::new("edit-fields", "Fields")
+                                .label_size(LabelSize::Small)
+                                .on_click(
+                                    cx.listener(|this, _, _window, cx| this.open_fields(cx)),
                                 ),
                         )
                         .child(
@@ -2381,6 +2649,7 @@ impl Render for PullRequestPanel {
             ActiveView::List => self.render_list(cx).into_any_element(),
             ActiveView::Detail => self.render_detail(cx).into_any_element(),
             ActiveView::Create => self.render_create(cx).into_any_element(),
+            ActiveView::Fields => self.render_fields(cx).into_any_element(),
         };
         v_flex()
             .key_context("PullRequestPanel")

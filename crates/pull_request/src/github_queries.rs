@@ -363,6 +363,96 @@ pub fn create_pull_request() -> String {
     )
 }
 
+pub fn repo_labels() -> &'static str {
+    r#"
+    query RepoLabels($owner: String!, $name: String!) {
+      repository(owner: $owner, name: $name) {
+        labels(first: 100) { nodes { id name } }
+      }
+    }
+    "#
+}
+
+pub fn assignable_users() -> &'static str {
+    r#"
+    query AssignableUsers($owner: String!, $name: String!) {
+      repository(owner: $owner, name: $name) {
+        assignableUsers(first: 100) { nodes { id login } }
+      }
+    }
+    "#
+}
+
+pub fn repo_milestones() -> &'static str {
+    r#"
+    query RepoMilestones($owner: String!, $name: String!) {
+      repository(owner: $owner, name: $name) {
+        milestones(first: 50, states: OPEN) { nodes { id title } }
+      }
+    }
+    "#
+}
+
+pub fn add_labels() -> &'static str {
+    r#"
+    mutation AddLabels($labelableId: ID!, $labelIds: [ID!]!) {
+      addLabelsToLabelable(input: { labelableId: $labelableId, labelIds: $labelIds }) {
+        labelable { __typename }
+      }
+    }
+    "#
+}
+
+pub fn remove_labels() -> &'static str {
+    r#"
+    mutation RemoveLabels($labelableId: ID!, $labelIds: [ID!]!) {
+      removeLabelsFromLabelable(input: { labelableId: $labelableId, labelIds: $labelIds }) {
+        labelable { __typename }
+      }
+    }
+    "#
+}
+
+pub fn add_assignees() -> &'static str {
+    r#"
+    mutation AddAssignees($assignableId: ID!, $assigneeIds: [ID!]!) {
+      addAssigneesToAssignable(input: { assignableId: $assignableId, assigneeIds: $assigneeIds }) {
+        assignable { __typename }
+      }
+    }
+    "#
+}
+
+pub fn remove_assignees() -> &'static str {
+    r#"
+    mutation RemoveAssignees($assignableId: ID!, $assigneeIds: [ID!]!) {
+      removeAssigneesFromAssignable(input: { assignableId: $assignableId, assigneeIds: $assigneeIds }) {
+        assignable { __typename }
+      }
+    }
+    "#
+}
+
+pub fn set_milestone() -> &'static str {
+    r#"
+    mutation SetMilestone($pullRequestId: ID!, $milestoneId: ID) {
+      updatePullRequest(input: { pullRequestId: $pullRequestId, milestoneId: $milestoneId }) {
+        pullRequest { id }
+      }
+    }
+    "#
+}
+
+pub fn request_reviewers() -> &'static str {
+    r#"
+    mutation RequestReviewers($pullRequestId: ID!, $userIds: [ID!]!) {
+      requestReviews(input: { pullRequestId: $pullRequestId, userIds: $userIds, union: false }) {
+        pullRequest { id }
+      }
+    }
+    "#
+}
+
 pub fn enable_auto_merge() -> &'static str {
     r#"
     mutation EnableAutoMerge($pullRequestId: ID!, $method: PullRequestMergeMethod!) {
