@@ -141,6 +141,9 @@ pub struct PullRequestPanel {
     create_head: Entity<Editor>,
     create_draft: bool,
     create_error: Option<SharedString>,
+    /// When set, the Create view edits this existing PR's title/body instead of
+    /// creating a new one.
+    edit_target: Option<SharedString>,
     search_editor: Entity<Editor>,
     _refresh_task: Option<Task<()>>,
     _detail_task: Option<Task<()>>,
@@ -263,6 +266,7 @@ impl PullRequestPanel {
             create_head,
             create_draft: false,
             create_error: None,
+            edit_target: None,
             search_editor,
             _refresh_task: None,
             _detail_task: None,
@@ -416,15 +420,61 @@ impl PullRequestPanel {
             .unwrap_or_default();
         self.create_head
             .update(cx, |editor, cx| editor.set_text(head, window, cx));
+        self.create_title
+            .update(cx, |editor, cx| editor.set_text("", window, cx));
+        self.create_body
+            .update(cx, |editor, cx| editor.set_text("", window, cx));
+        self.edit_target = None;
+        self.create_error = None;
+        self.active_view = ActiveView::Create;
+        cx.notify();
+    }
+
+    /// Edit the selected PR's title/body, reusing the Create form.
+    fn start_edit_pr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(loaded) = self.selected.as_ref() else {
+            return;
+        };
+        let title = loaded.detail.info.title.to_string();
+        let body = loaded.detail.body.to_string();
+        self.edit_target = Some(loaded.detail.info.id.node_id.clone());
+        self.create_title
+            .update(cx, |editor, cx| editor.set_text(title, window, cx));
+        self.create_body
+            .update(cx, |editor, cx| editor.set_text(body, window, cx));
         self.create_error = None;
         self.active_view = ActiveView::Create;
         cx.notify();
     }
 
     fn submit_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(provider), Some(owner), Some(repo)) =
-            (self.provider.clone(), self.owner.clone(), self.repo.clone())
-        else {
+        let Some(provider) = self.provider.clone() else {
+            return;
+        };
+        // Edit mode updates the existing PR's title/body.
+        if let Some(node_id) = self.edit_target.clone() {
+            let title = self.create_title.read(cx).text(cx);
+            let body = self.create_body.read(cx).text(cx);
+            self.edit_target = None;
+            self.active_view = ActiveView::Detail;
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                let result = provider
+                    .update_pull_request(&node_id, Some(&title), Some(&body))
+                    .await;
+                this.update(cx, |this, cx| {
+                    if let Err(error) = result {
+                        this.detail_error = Some(error.to_string().into());
+                    }
+                    this.refresh_detail(cx);
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+
+        let (Some(owner), Some(repo)) = (self.owner.clone(), self.repo.clone()) else {
             return;
         };
         let title = self.create_title.read(cx).text(cx);
@@ -1107,15 +1157,30 @@ impl PullRequestPanel {
     }
 
     fn render_create(&self, cx: &Context<Self>) -> impl IntoElement {
+        let is_edit = self.edit_target.is_some();
         let header = h_flex()
             .gap_1()
             .p_2()
             .child(
                 IconButton::new("create-back", IconName::ArrowLeft)
-                    .tooltip(Tooltip::text("Back to list"))
-                    .on_click(cx.listener(|this, _, _window, cx| this.back_to_list(cx))),
+                    .tooltip(Tooltip::text("Back"))
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        if this.edit_target.take().is_some() {
+                            this.active_view = ActiveView::Detail;
+                            cx.notify();
+                        } else {
+                            this.back_to_list(cx);
+                        }
+                    })),
             )
-            .child(Label::new("New pull request").size(LabelSize::Small));
+            .child(
+                Label::new(if is_edit {
+                    "Edit pull request"
+                } else {
+                    "New pull request"
+                })
+                .size(LabelSize::Small),
+            );
 
         v_flex()
             .size_full()
@@ -1129,46 +1194,51 @@ impl PullRequestPanel {
                     })
                     .child(Label::new("Title").size(LabelSize::XSmall).color(Color::Muted))
                     .child(self.create_title.clone())
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                v_flex()
-                                    .gap_0p5()
-                                    .child(
-                                        Label::new("Base")
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(self.create_base.clone()),
-                            )
-                            .child(
-                                v_flex()
-                                    .gap_0p5()
-                                    .child(
-                                        Label::new("Head")
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(self.create_head.clone()),
-                            ),
-                    )
+                    .when(!is_edit, |this| {
+                        this.child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    v_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            Label::new("Base")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(self.create_base.clone()),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_0p5()
+                                        .child(
+                                            Label::new("Head")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(self.create_head.clone()),
+                                ),
+                        )
+                    })
                     .child(Label::new("Description").size(LabelSize::XSmall).color(Color::Muted))
                     .child(self.create_body.clone())
+                    .when(!is_edit, |this| {
+                        this.child(
+                            Checkbox::new("create-draft", to_toggle(self.create_draft))
+                                .label("Create as draft")
+                                .on_click(cx.listener(|this, state: &ToggleState, _window, cx| {
+                                    this.create_draft = *state == ToggleState::Selected;
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(
-                        Checkbox::new("create-draft", to_toggle(self.create_draft))
-                            .label("Create as draft")
-                            .on_click(cx.listener(|this, state: &ToggleState, _window, cx| {
-                                this.create_draft = *state == ToggleState::Selected;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("create-submit", "Create pull request")
-                            .style(ButtonStyle::Filled)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.submit_create(window, cx)
-                            })),
+                        Button::new(
+                            "create-submit",
+                            if is_edit { "Save" } else { "Create pull request" },
+                        )
+                        .style(ButtonStyle::Filled)
+                        .on_click(cx.listener(|this, _, window, cx| this.submit_create(window, cx))),
                     ),
             )
     }
@@ -1402,6 +1472,13 @@ impl PullRequestPanel {
                 this.child(
                     h_flex()
                         .gap_1()
+                        .child(
+                            Button::new("edit-pr", "Edit")
+                                .label_size(LabelSize::Small)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.start_edit_pr(window, cx)),
+                                ),
+                        )
                         .child(
                             Button::new(
                                 "close-reopen",
