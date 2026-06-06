@@ -17,7 +17,7 @@ use crate::diff_position::thread_anchor;
 use crate::file_tree::build_tree_rows;
 use buffer_diff::BufferDiff;
 use editor::display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle};
-use editor::{Anchor, Editor};
+use editor::{Anchor, Editor, EditorSettings, SplittableEditor};
 use http_client::HttpClient;
 use language::Buffer;
 use multi_buffer::MultiBuffer;
@@ -2665,16 +2665,24 @@ fn open_diff_item(
         multibuffer.set_all_diff_hunks_expanded(cx);
         multibuffer
     });
+    // SplittableEditor honors the editor.diff_view_style setting (split/unified)
+    // and supports the toggle-split-diff action.
+    let style = EditorSettings::get_global(cx).diff_view_style;
+    let workspace_entity = cx.entity();
     let editor = cx.new(|cx| {
-        let mut editor = Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx);
-        // Render the editor as a diff (base ↔ buffer) rather than a plain file.
-        editor.start_temporary_diff_override();
-        if read_only {
-            editor.set_read_only(true);
-        }
-        editor
+        let splittable =
+            SplittableEditor::new(style, multibuffer, project.clone(), workspace_entity, window, cx);
+        splittable.rhs_editor().update(cx, |editor, _cx| {
+            editor.start_temporary_diff_override();
+            if read_only {
+                editor.set_read_only(true);
+            }
+        });
+        splittable.disable_diff_hunk_controls(cx);
+        splittable
     });
-    inject_thread_blocks(&editor, threads, cx);
+    // Inline comment blocks live on the head (right) side.
+    inject_thread_blocks(&editor.read(cx).rhs_editor().clone(), threads, cx);
     workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
 }
 
