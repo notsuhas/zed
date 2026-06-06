@@ -767,7 +767,7 @@ fn main() {
         notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         collab_ui::init(&app_state, cx);
         git_ui::init(cx);
-        review_ui::init(cx);
+        pull_request::init(cx);
         feedback::init(cx);
         markdown_preview::init(cx);
         csv_preview::init(cx);

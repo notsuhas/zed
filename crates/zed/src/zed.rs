@@ -728,7 +728,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
-        let review_panel = review_ui::ReviewPanel::load(workspace_handle.clone(), cx.clone());
+        let review_panel = pull_request::ReviewPanel::load(workspace_handle.clone(), cx.clone());
         let channels_panel =
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
@@ -5490,7 +5490,7 @@ mod tests {
             editor::init(cx);
             collab_ui::init(&app_state, cx);
             git_ui::init(cx);
-            review_ui::init(cx);
+            pull_request::init(cx);
             project_panel::init(cx);
             outline_panel::init(cx);
             terminal_view::init(cx);

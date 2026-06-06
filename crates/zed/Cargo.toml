@@ -51,7 +51,7 @@ visual-tests = [
     "fs/test-support",
     "recent_projects/test-support",
     "title_bar/test-support",
-    "review_ui/test-support",
+    "pull_request/test-support",
 ]
 
 [[bin]]
@@ -178,7 +178,7 @@ remote.workspace = true
 repl.workspace = true
 reqwest.workspace = true
 reqwest_client.workspace = true
-review_ui.workspace = true
+pull_request.workspace = true
 rope.workspace = true
 search.workspace = true
 serde.workspace = true

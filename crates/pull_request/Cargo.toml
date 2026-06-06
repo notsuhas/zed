@@ -1,5 +1,5 @@
 [package]
-name = "review_ui"
+name = "pull_request"
 version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
@@ -12,7 +12,7 @@ workspace = true
 test-support = []
 
 [lib]
-path = "src/review_ui.rs"
+path = "src/pull_request.rs"
 doctest = false
 
 [dependencies]
