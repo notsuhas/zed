@@ -1173,3 +1173,177 @@ impl PullRequestProvider for GitHubProvider {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserializes_files_with_viewed_state() {
+        let json = r#"{
+            "repository": { "pullRequest": { "files": {
+                "nodes": [
+                    { "path": "src/main.rs", "additions": 10, "deletions": 2, "changeType": "MODIFIED", "viewerViewedState": "VIEWED" },
+                    { "path": "src/new.rs", "additions": 30, "deletions": 0, "changeType": "ADDED", "viewerViewedState": "UNVIEWED" },
+                    { "path": "src/gone.rs", "additions": 0, "deletions": 12, "changeType": "DELETED", "viewerViewedState": "DISMISSED" }
+                ],
+                "pageInfo": { "hasNextPage": false, "endCursor": null }
+            } } }
+        }"#;
+        let data: FilesData = serde_json::from_str(json).unwrap();
+        let files = data.repository.pull_request.files.nodes;
+        assert_eq!(files.len(), 3);
+        assert!(matches!(
+            map_change_type(&files[0].change_type),
+            FileChangeStatus::Modified
+        ));
+        assert_eq!(map_viewed_state(&files[0].viewer_viewed_state), ViewedState::Viewed);
+        assert!(matches!(
+            map_change_type(&files[1].change_type),
+            FileChangeStatus::Added
+        ));
+        assert_eq!(map_viewed_state(&files[1].viewer_viewed_state), ViewedState::Unviewed);
+        assert!(matches!(
+            map_change_type(&files[2].change_type),
+            FileChangeStatus::Deleted
+        ));
+        assert_eq!(
+            map_viewed_state(&files[2].viewer_viewed_state),
+            ViewedState::Dismissed
+        );
+    }
+
+    #[test]
+    fn deserializes_review_threads_with_positions() {
+        let json = r#"{
+            "repository": { "pullRequest": { "reviewThreads": {
+                "nodes": [
+                    {
+                        "id": "RT_1", "path": "src/main.rs", "diffSide": "RIGHT",
+                        "line": 42, "startLine": 40, "originalLine": 41, "originalStartLine": null,
+                        "isResolved": false, "isOutdated": false,
+                        "viewerCanResolve": true, "viewerCanUnresolve": false,
+                        "comments": { "nodes": [
+                            {
+                                "id": "RC_1", "databaseId": 555, "author": { "login": "octocat", "avatarUrl": "https://x/y.png" },
+                                "body": "nit: rename this", "diffHunk": "@@ -40,3 +40,3 @@", "createdAt": "2026-01-01T00:00:00Z",
+                                "viewerCanUpdate": true, "viewerCanDelete": true,
+                                "pullRequestReview": { "databaseId": 9 },
+                                "reactionGroups": [ { "content": "THUMBS_UP", "viewerHasReacted": true, "reactors": { "totalCount": 3 } } ]
+                            }
+                        ] }
+                    },
+                    {
+                        "id": "RT_2", "path": "src/old.rs", "diffSide": "LEFT",
+                        "line": null, "startLine": null, "originalLine": 7, "originalStartLine": null,
+                        "isResolved": true, "isOutdated": true,
+                        "viewerCanResolve": false, "viewerCanUnresolve": true,
+                        "comments": { "nodes": [] }
+                    }
+                ],
+                "pageInfo": { "hasNextPage": false, "endCursor": null }
+            } } }
+        }"#;
+        let data: ThreadsData = serde_json::from_str(json).unwrap();
+        let threads: Vec<ReviewThread> = data
+            .repository
+            .pull_request
+            .review_threads
+            .nodes
+            .into_iter()
+            .map(GqlThread::into_thread)
+            .collect();
+        assert_eq!(threads.len(), 2);
+
+        let first = &threads[0];
+        assert_eq!(first.diff_side, DiffSide::Right);
+        assert_eq!(first.line, Some(42));
+        assert_eq!(first.start_line, Some(40));
+        assert!(!first.is_resolved);
+        assert!(first.viewer_can_resolve);
+        assert_eq!(first.comments.len(), 1);
+        let comment = &first.comments[0];
+        assert_eq!(comment.author.login.as_ref(), "octocat");
+        assert_eq!(comment.database_id, Some(555));
+        assert_eq!(comment.review_database_id, Some(9));
+        assert_eq!(comment.reactions.len(), 1);
+        assert_eq!(comment.reactions[0].count, 3);
+        assert!(comment.reactions[0].viewer_has_reacted);
+
+        let second = &threads[1];
+        assert_eq!(second.diff_side, DiffSide::Left);
+        assert!(second.is_resolved);
+        assert!(second.is_outdated);
+        assert_eq!(second.original_line, Some(7));
+    }
+
+    #[test]
+    fn deserializes_pr_detail_with_checks_and_reviewers() {
+        let json = r#"{
+            "repository": { "pullRequest": {
+                "id": "PR_1", "number": 7, "title": "Add feature", "state": "OPEN", "isDraft": false,
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+                "additions": 100, "deletions": 5, "url": "https://github.com/o/r/pull/7",
+                "author": { "login": "octocat", "avatarUrl": null },
+                "baseRefName": "main", "headRefName": "feature", "baseRefOid": "aaa", "headRefOid": "bbb",
+                "comments": { "totalCount": 4 },
+                "body": "Body text", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+                "viewerCanUpdate": true, "viewerCanMergeAsAdmin": false,
+                "milestone": { "title": "v1" },
+                "labels": { "nodes": [ { "name": "bug" }, { "name": "enhancement" } ] },
+                "assignees": { "nodes": [ { "login": "alice", "avatarUrl": null } ] },
+                "reactionGroups": [],
+                "latestReviews": { "nodes": [ { "state": "APPROVED", "author": { "login": "bob", "avatarUrl": null } } ] },
+                "reviewRequests": { "nodes": [ { "requestedReviewer": { "login": "carol", "avatarUrl": null } } ] },
+                "commits": { "nodes": [ { "commit": { "statusCheckRollup": {
+                    "state": "SUCCESS",
+                    "contexts": { "nodes": [
+                        { "name": "build", "conclusion": "SUCCESS", "status": "COMPLETED", "detailsUrl": "https://ci/1" },
+                        { "context": "legacy/ci", "state": "FAILURE", "targetUrl": "https://ci/2", "description": "failed" }
+                    ] }
+                } } } ] }
+            } }
+        }"#;
+        let data: RepoData<GqlPrDetail> = serde_json::from_str(json).unwrap();
+        let pr = map_detail(data.repository.pull_request, "o", "r");
+        assert_eq!(pr.info.id.number, 7);
+        assert_eq!(pr.info.state, PullRequestState::Open);
+        assert_eq!(pr.info.author.login.as_ref(), "octocat");
+        assert_eq!(pr.body.as_ref(), "Body text");
+        assert_eq!(pr.mergeable, Some(true));
+        assert_eq!(pr.labels.len(), 2);
+        assert_eq!(pr.assignees.len(), 1);
+        assert_eq!(pr.check_rollup, Some(CheckStatus::Success));
+        assert_eq!(pr.checks.len(), 2);
+        assert_eq!(pr.checks[0].status, CheckStatus::Success);
+        assert_eq!(pr.checks[1].status, CheckStatus::Failure);
+        // bob approved + carol requested.
+        assert_eq!(pr.reviewers.len(), 2);
+        assert!(pr.reviewers.iter().any(|r| r.actor.login.as_ref() == "bob"
+            && r.verdict == Some(ReviewVerdict::Approved)));
+        assert!(pr.reviewers.iter().any(|r| r.actor.login.as_ref() == "carol"
+            && r.verdict.is_none()));
+    }
+
+    #[test]
+    fn skips_non_pr_search_nodes() {
+        // search(type: ISSUE) can return issues; nodes without PR fields are skipped.
+        let json = r#"{ "search": { "nodes": [
+            {},
+            { "id": "PR_1", "number": 1, "title": "T", "state": "OPEN", "isDraft": false,
+              "createdAt": "", "updatedAt": "", "additions": 0, "deletions": 0, "url": "",
+              "author": null, "baseRefName": "main", "headRefName": "f", "baseRefOid": "",
+              "headRefOid": "", "comments": { "totalCount": 0 } }
+        ] } }"#;
+        let data: ListData = serde_json::from_str(json).unwrap();
+        let prs: Vec<PullRequestInfo> = data
+            .search
+            .nodes
+            .into_iter()
+            .filter_map(|node| serde_json::from_value::<GqlPrInfo>(node).ok())
+            .map(|info| info.into_info("o", "r"))
+            .collect();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].author.login.as_ref(), "ghost");
+    }
+}
