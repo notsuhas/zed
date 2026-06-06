@@ -1,245 +1,18 @@
-use crate::review_provider::*;
-use anyhow::{Context as _, bail};
-use futures::AsyncReadExt;
+//! GitHub implementation of [`PullRequestProvider`] over the GraphQL v4 API.
+//!
+//! Wire (`Gql*`) types deserialize the query selections in `github_queries`,
+//! then map into the forge-agnostic domain types in `provider`. The mapping
+//! layer is where all GitHub-specific string enums (`"OPEN"`, `"RIGHT"`,
+//! `"VIEWED"`, …) are normalized.
+#![allow(dead_code)]
+
+use crate::github_graphql::execute;
+use crate::github_queries as q;
+use crate::provider::*;
 use gpui::SharedString;
-use http_client::{AsyncBody, HttpClient, HttpRequestExt, RedirectPolicy, Request};
+use http_client::HttpClient;
 use serde::Deserialize;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-
-const GITHUB_API_URL: &str = "https://api.github.com";
-
-#[derive(Deserialize)]
-struct GhPullRequest {
-    number: u32,
-    title: String,
-    user: GhUser,
-    body: Option<String>,
-    state: String,
-    base: GhRef,
-    head: GhRef,
-    created_at: String,
-    updated_at: String,
-    merged_at: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GhUser {
-    login: String,
-}
-
-#[derive(Deserialize)]
-struct GhRef {
-    #[serde(rename = "ref")]
-    ref_name: String,
-    sha: String,
-}
-
-#[derive(Deserialize)]
-struct GhFile {
-    filename: String,
-    status: String,
-    additions: u32,
-    deletions: u32,
-    previous_filename: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GhReviewComment {
-    id: u64,
-    user: GhUser,
-    body: String,
-    created_at: String,
-    path: Option<String>,
-    line: Option<u32>,
-    in_reply_to_id: Option<u64>,
-    diff_hunk: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GhReview {
-    id: u64,
-    user: GhUser,
-    body: Option<String>,
-    state: String,
-    submitted_at: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GhIssueComment {
-    id: u64,
-    user: GhUser,
-    body: String,
-    created_at: String,
-}
-
-async fn github_get<T: serde::de::DeserializeOwned>(
-    http_client: &Arc<dyn HttpClient>,
-    token: &Option<String>,
-    url: &str,
-) -> anyhow::Result<T> {
-    let mut builder = Request::get(url)
-        .header("Accept", "application/vnd.github.v3+json")
-        .follow_redirects(RedirectPolicy::FollowAll);
-
-    if let Some(token) = token {
-        builder = builder.header("Authorization", format!("Bearer {}", token));
-    }
-
-    let request = builder.body(AsyncBody::default())?;
-    let mut response = http_client.send(request).await?;
-
-    let mut body = Vec::new();
-    response.body_mut().read_to_end(&mut body).await?;
-
-    if !response.status().is_success() {
-        let text = String::from_utf8_lossy(&body);
-        bail!("GitHub API error {}: {}", response.status().as_u16(), text);
-    }
-
-    serde_json::from_slice(&body).context("failed to parse GitHub response")
-}
-
-async fn github_get_paginated<T: serde::de::DeserializeOwned>(
-    http_client: &Arc<dyn HttpClient>,
-    token: &Option<String>,
-    url: &str,
-) -> anyhow::Result<Vec<T>> {
-    let mut page = 1;
-    let mut results = Vec::new();
-
-    loop {
-        let separator = if url.contains('?') { '&' } else { '?' };
-        let page_url = format!("{url}{separator}per_page=100&page={page}");
-        let mut items: Vec<T> = github_get(http_client, token, &page_url).await?;
-        let is_last_page = items.len() < 100;
-        results.append(&mut items);
-
-        if is_last_page {
-            break;
-        }
-
-        page += 1;
-    }
-
-    Ok(results)
-}
-
-async fn github_post<T: serde::de::DeserializeOwned>(
-    http_client: &Arc<dyn HttpClient>,
-    token: &Option<String>,
-    url: &str,
-    json_body: String,
-) -> anyhow::Result<T> {
-    let mut builder = Request::post(url)
-        .header("Accept", "application/vnd.github.v3+json")
-        .header("Content-Type", "application/json")
-        .follow_redirects(RedirectPolicy::FollowAll);
-
-    if let Some(token) = token {
-        builder = builder.header("Authorization", format!("Bearer {}", token));
-    }
-
-    let request = builder.body(AsyncBody::from(json_body))?;
-    let mut response = http_client.send(request).await?;
-
-    let mut body = Vec::new();
-    response.body_mut().read_to_end(&mut body).await?;
-
-    if !response.status().is_success() {
-        let text = String::from_utf8_lossy(&body);
-        bail!("GitHub API error {}: {}", response.status().as_u16(), text);
-    }
-
-    serde_json::from_slice(&body).context("failed to parse GitHub response")
-}
-
-fn map_pr_state(state: &str, merged_at: Option<&str>) -> PullRequestState {
-    match state {
-        "open" => PullRequestState::Open,
-        "closed" if merged_at.is_some() => PullRequestState::Merged,
-        "closed" => PullRequestState::Closed,
-        _ => PullRequestState::Closed,
-    }
-}
-
-fn map_file_status(status: &str, previous_filename: Option<String>) -> FileChangeStatus {
-    match status {
-        "added" => FileChangeStatus::Added,
-        "modified" | "changed" => FileChangeStatus::Modified,
-        "removed" => FileChangeStatus::Deleted,
-        "renamed" => FileChangeStatus::Renamed {
-            from: previous_filename.unwrap_or_default().into(),
-        },
-        _ => FileChangeStatus::Modified,
-    }
-}
-
-fn map_pull_request(pr: GhPullRequest) -> PullRequestInfo {
-    PullRequestInfo {
-        number: pr.number,
-        title: pr.title.into(),
-        author: pr.user.login.into(),
-        description: pr.body.unwrap_or_default().into(),
-        state: map_pr_state(&pr.state, pr.merged_at.as_deref()),
-        base_ref: pr.base.ref_name.into(),
-        head_ref: pr.head.ref_name.into(),
-        base_sha: pr.base.sha.into(),
-        head_sha: pr.head.sha.into(),
-        created_at: pr.created_at.into(),
-        updated_at: pr.updated_at.into(),
-        review_status: ReviewStatus::Pending,
-    }
-}
-
-fn map_review_state(state: &str) -> Option<ReviewStatus> {
-    match state {
-        "APPROVED" => Some(ReviewStatus::Approved),
-        "CHANGES_REQUESTED" => Some(ReviewStatus::ChangesRequested),
-        "COMMENTED" => Some(ReviewStatus::Commented),
-        _ => None,
-    }
-}
-
-async fn fetch_review_status(
-    http_client: &Arc<dyn HttpClient>,
-    token: &Option<String>,
-    owner: &str,
-    repo: &str,
-    number: u32,
-) -> anyhow::Result<ReviewStatus> {
-    let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/reviews");
-    let reviews: Vec<GhReview> = github_get_paginated(http_client, token, &url).await?;
-
-    Ok(reviews
-        .iter()
-        .rev()
-        .find_map(|review| map_review_state(&review.state))
-        .unwrap_or(ReviewStatus::Pending))
-}
-
-fn map_file(file: GhFile) -> PullRequestFile {
-    PullRequestFile {
-        path: file.filename.into(),
-        status: map_file_status(&file.status, file.previous_filename),
-        additions: file.additions,
-        deletions: file.deletions,
-    }
-}
-
-fn map_review_comment(comment: GhReviewComment) -> ReviewComment {
-    ReviewComment {
-        id: comment.id,
-        author: comment.user.login.into(),
-        body: comment.body.into(),
-        created_at: comment.created_at.into(),
-        path: comment.path.map(SharedString::from),
-        line: comment.line,
-        reply_to: comment.in_reply_to_id,
-        diff_hunk: comment.diff_hunk.map(SharedString::from),
-    }
-}
 
 pub struct GitHubProvider {
     http_client: Arc<dyn HttpClient>,
@@ -250,296 +23,1153 @@ impl GitHubProvider {
     pub fn new(http_client: Arc<dyn HttpClient>, token: Option<String>) -> Self {
         Self { http_client, token }
     }
+
+    fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
 }
 
-impl ReviewProvider for GitHubProvider {
+// ---------------------------------------------------------------------------
+// Wire types
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlActor {
+    login: Option<String>,
+    name: Option<String>,
+    avatar_url: Option<String>,
+}
+
+impl GqlActor {
+    fn into_actor(self) -> Actor {
+        Actor {
+            login: self
+                .login
+                .or(self.name)
+                .unwrap_or_else(|| "ghost".into())
+                .into(),
+            avatar_url: self.avatar_url.map(Into::into),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlTotalCount {
+    total_count: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlReactionGroup {
+    content: String,
+    viewer_has_reacted: bool,
+    reactors: GqlTotalCount,
+}
+
+impl GqlReactionGroup {
+    fn into_group(self) -> ReactionGroup {
+        ReactionGroup {
+            content: self.content.into(),
+            viewer_has_reacted: self.viewer_has_reacted,
+            count: self.reactors.total_count,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlPrInfo {
+    id: String,
+    number: u32,
+    title: String,
+    state: String,
+    is_draft: bool,
+    created_at: String,
+    updated_at: String,
+    additions: u32,
+    deletions: u32,
+    url: String,
+    author: Option<GqlActor>,
+    base_ref_name: String,
+    head_ref_name: String,
+    base_ref_oid: String,
+    head_ref_oid: String,
+    comments: GqlTotalCount,
+}
+
+impl GqlPrInfo {
+    fn into_info(self, owner: &str, repo: &str) -> PullRequestInfo {
+        PullRequestInfo {
+            id: PullRequestId {
+                node_id: self.id.into(),
+                number: self.number,
+                owner: owner.to_string().into(),
+                repo: repo.to_string().into(),
+            },
+            title: self.title.into(),
+            author: self.author.map(GqlActor::into_actor).unwrap_or(Actor {
+                login: "ghost".into(),
+                avatar_url: None,
+            }),
+            state: map_pr_state(&self.state),
+            is_draft: self.is_draft,
+            base_ref: self.base_ref_name.into(),
+            head_ref: self.head_ref_name.into(),
+            base_sha: self.base_ref_oid.into(),
+            head_sha: self.head_ref_oid.into(),
+            created_at: self.created_at.into(),
+            updated_at: self.updated_at.into(),
+            additions: self.additions,
+            deletions: self.deletions,
+            comment_count: self.comments.total_count,
+            url: self.url.into(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ListData {
+    search: GqlSearch,
+}
+
+#[derive(Deserialize)]
+struct GqlSearch {
+    nodes: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct RepoData<T> {
+    repository: RepoPullRequest<T>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RepoPullRequest<T> {
+    pull_request: T,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlPrDetail {
+    #[serde(flatten)]
+    info: GqlPrInfo,
+    body: Option<String>,
+    mergeable: Option<String>,
+    merge_state_status: Option<String>,
+    viewer_can_update: bool,
+    viewer_can_merge_as_admin: bool,
+    milestone: Option<GqlMilestone>,
+    labels: GqlNodes<GqlLabel>,
+    assignees: GqlNodes<GqlActor>,
+    reaction_groups: Vec<GqlReactionGroup>,
+    latest_reviews: GqlNodes<GqlLatestReview>,
+    review_requests: GqlNodes<GqlReviewRequest>,
+    commits: GqlNodes<GqlCommitNode>,
+}
+
+#[derive(Deserialize)]
+struct GqlNodes<T> {
+    nodes: Vec<T>,
+}
+
+#[derive(Deserialize)]
+struct GqlMilestone {
+    title: String,
+}
+
+#[derive(Deserialize)]
+struct GqlLabel {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct GqlLatestReview {
+    state: String,
+    author: Option<GqlActor>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlReviewRequest {
+    requested_reviewer: Option<GqlActor>,
+}
+
+#[derive(Deserialize)]
+struct GqlCommitNode {
+    commit: GqlCommit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlCommit {
+    status_check_rollup: Option<GqlStatusRollup>,
+}
+
+#[derive(Deserialize)]
+struct GqlStatusRollup {
+    state: String,
+    contexts: GqlNodes<GqlCheckContext>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlCheckContext {
+    // CheckRun
+    name: Option<String>,
+    conclusion: Option<String>,
+    status: Option<String>,
+    details_url: Option<String>,
+    // StatusContext
+    context: Option<String>,
+    state: Option<String>,
+    target_url: Option<String>,
+    description: Option<String>,
+}
+
+impl GqlCheckContext {
+    fn into_check(self) -> CheckRun {
+        if let Some(name) = self.name {
+            // CheckRun: prefer conclusion, fall back to in-flight status.
+            let status = self
+                .conclusion
+                .as_deref()
+                .map(map_check_conclusion)
+                .unwrap_or_else(|| map_check_status(self.status.as_deref()));
+            CheckRun {
+                name: name.into(),
+                status,
+                url: self.details_url.map(Into::into),
+                description: None,
+            }
+        } else {
+            CheckRun {
+                name: self.context.unwrap_or_default().into(),
+                status: map_status_state(self.state.as_deref()),
+                url: self.target_url.map(Into::into),
+                description: self.description.map(Into::into),
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct FilesData {
+    repository: RepoPullRequest<GqlFilesConnection>,
+}
+
+#[derive(Deserialize)]
+struct GqlFilesConnection {
+    files: GqlPageConnection<GqlFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlPageConnection<T> {
+    nodes: Vec<T>,
+    page_info: GqlPageInfo,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlPageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlFile {
+    path: String,
+    additions: u32,
+    deletions: u32,
+    change_type: String,
+    viewer_viewed_state: String,
+}
+
+#[derive(Deserialize)]
+struct ThreadsData {
+    repository: RepoPullRequest<GqlThreadsConnection>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlThreadsConnection {
+    review_threads: GqlPageConnection<GqlThread>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlThread {
+    id: String,
+    path: String,
+    diff_side: String,
+    line: Option<u32>,
+    start_line: Option<u32>,
+    original_line: Option<u32>,
+    original_start_line: Option<u32>,
+    is_resolved: bool,
+    is_outdated: bool,
+    viewer_can_resolve: bool,
+    viewer_can_unresolve: bool,
+    comments: GqlNodes<GqlComment>,
+}
+
+impl GqlThread {
+    fn into_thread(self) -> ReviewThread {
+        ReviewThread {
+            id: self.id.into(),
+            path: self.path.into(),
+            diff_side: map_diff_side(&self.diff_side),
+            line: self.line,
+            start_line: self.start_line,
+            original_line: self.original_line,
+            original_start_line: self.original_start_line,
+            is_resolved: self.is_resolved,
+            is_outdated: self.is_outdated,
+            viewer_can_resolve: self.viewer_can_resolve,
+            viewer_can_unresolve: self.viewer_can_unresolve,
+            comments: self.comments.nodes.into_iter().map(GqlComment::into_comment).collect(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlComment {
+    id: String,
+    database_id: Option<u64>,
+    author: Option<GqlActor>,
+    body: String,
+    diff_hunk: Option<String>,
+    created_at: String,
+    viewer_can_update: bool,
+    viewer_can_delete: bool,
+    pull_request_review: Option<GqlReviewRef>,
+    reaction_groups: Vec<GqlReactionGroup>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlReviewRef {
+    database_id: Option<u64>,
+}
+
+impl GqlComment {
+    fn into_comment(self) -> ReviewComment {
+        ReviewComment {
+            id: self.id.into(),
+            database_id: self.database_id,
+            author: self.author.map(GqlActor::into_actor).unwrap_or(Actor {
+                login: "ghost".into(),
+                avatar_url: None,
+            }),
+            body: self.body.into(),
+            diff_hunk: self.diff_hunk.map(Into::into),
+            created_at: self.created_at.into(),
+            reactions: self
+                .reaction_groups
+                .into_iter()
+                .map(GqlReactionGroup::into_group)
+                .collect(),
+            viewer_can_update: self.viewer_can_update,
+            viewer_can_delete: self.viewer_can_delete,
+            review_database_id: self.pull_request_review.and_then(|r| r.database_id),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TimelineData {
+    repository: RepoPullRequest<GqlTimelineConnection>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlTimelineConnection {
+    timeline_items: GqlNodes<GqlTimelineItem>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlTimelineItem {
+    #[serde(rename = "__typename")]
+    typename: String,
+    commit: Option<GqlTimelineCommit>,
+    author: Option<GqlActor>,
+    actor: Option<GqlActor>,
+    state: Option<String>,
+    body: Option<String>,
+    created_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlTimelineCommit {
+    oid: String,
+    message_headline: String,
+    author: Option<GqlCommitAuthor>,
+}
+
+#[derive(Deserialize)]
+struct GqlCommitAuthor {
+    user: Option<GqlActor>,
+}
+
+impl GqlTimelineItem {
+    fn into_item(self) -> TimelineItem {
+        let created_at: SharedString = self.created_at.clone().unwrap_or_default().into();
+        match self.typename.as_str() {
+            "PullRequestCommit" => {
+                let commit = self.commit;
+                TimelineItem::Commit {
+                    oid: commit.as_ref().map(|c| c.oid.clone()).unwrap_or_default().into(),
+                    message: commit
+                        .as_ref()
+                        .map(|c| c.message_headline.clone())
+                        .unwrap_or_default()
+                        .into(),
+                    author: commit
+                        .and_then(|c| c.author)
+                        .and_then(|a| a.user)
+                        .map(GqlActor::into_actor),
+                }
+            }
+            "PullRequestReview" => TimelineItem::Review {
+                author: self.author.map(GqlActor::into_actor).unwrap_or(Actor {
+                    login: "ghost".into(),
+                    avatar_url: None,
+                }),
+                verdict: map_review_verdict(self.state.as_deref().unwrap_or("COMMENTED")),
+                body: self.body.unwrap_or_default().into(),
+                created_at,
+            },
+            "IssueComment" => TimelineItem::Comment {
+                author: self.author.map(GqlActor::into_actor).unwrap_or(Actor {
+                    login: "ghost".into(),
+                    avatar_url: None,
+                }),
+                body: self.body.unwrap_or_default().into(),
+                created_at,
+            },
+            "MergedEvent" => TimelineItem::Merged {
+                actor: self.actor.map(GqlActor::into_actor),
+                created_at,
+            },
+            "ClosedEvent" => TimelineItem::Closed {
+                actor: self.actor.map(GqlActor::into_actor),
+                created_at,
+            },
+            "ReopenedEvent" => TimelineItem::Reopened {
+                actor: self.actor.map(GqlActor::into_actor),
+                created_at,
+            },
+            "HeadRefForcePushedEvent" => TimelineItem::HeadRefForcePushed {
+                actor: self.actor.map(GqlActor::into_actor),
+                created_at,
+            },
+            other => TimelineItem::Other {
+                kind: other.to_string().into(),
+                created_at,
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enum mapping
+// ---------------------------------------------------------------------------
+
+fn map_pr_state(state: &str) -> PullRequestState {
+    match state {
+        "MERGED" => PullRequestState::Merged,
+        "CLOSED" => PullRequestState::Closed,
+        _ => PullRequestState::Open,
+    }
+}
+
+fn map_diff_side(side: &str) -> DiffSide {
+    match side {
+        "LEFT" => DiffSide::Left,
+        _ => DiffSide::Right,
+    }
+}
+
+fn map_change_type(change_type: &str) -> FileChangeStatus {
+    match change_type {
+        "ADDED" => FileChangeStatus::Added,
+        "DELETED" => FileChangeStatus::Deleted,
+        "RENAMED" => FileChangeStatus::Renamed { from: "".into() },
+        "COPIED" => FileChangeStatus::Copied { from: "".into() },
+        _ => FileChangeStatus::Modified,
+    }
+}
+
+fn map_viewed_state(state: &str) -> ViewedState {
+    match state {
+        "VIEWED" => ViewedState::Viewed,
+        "DISMISSED" => ViewedState::Dismissed,
+        _ => ViewedState::Unviewed,
+    }
+}
+
+fn map_review_verdict(state: &str) -> ReviewVerdict {
+    match state {
+        "APPROVED" => ReviewVerdict::Approved,
+        "CHANGES_REQUESTED" => ReviewVerdict::ChangesRequested,
+        "DISMISSED" => ReviewVerdict::Dismissed,
+        "PENDING" => ReviewVerdict::Pending,
+        _ => ReviewVerdict::Commented,
+    }
+}
+
+fn map_status_state(state: Option<&str>) -> CheckStatus {
+    match state {
+        Some("SUCCESS") => CheckStatus::Success,
+        Some("FAILURE") => CheckStatus::Failure,
+        Some("ERROR") => CheckStatus::Error,
+        Some("EXPECTED") | Some("PENDING") => CheckStatus::Pending,
+        _ => CheckStatus::Pending,
+    }
+}
+
+fn map_check_conclusion(conclusion: &str) -> CheckStatus {
+    match conclusion {
+        "SUCCESS" => CheckStatus::Success,
+        "FAILURE" | "STARTUP_FAILURE" | "TIMED_OUT" => CheckStatus::Failure,
+        "ACTION_REQUIRED" | "STALE" => CheckStatus::Error,
+        "CANCELLED" => CheckStatus::Cancelled,
+        "NEUTRAL" => CheckStatus::Neutral,
+        "SKIPPED" => CheckStatus::Skipped,
+        _ => CheckStatus::Pending,
+    }
+}
+
+fn map_check_status(status: Option<&str>) -> CheckStatus {
+    match status {
+        Some("COMPLETED") => CheckStatus::Success,
+        _ => CheckStatus::Pending,
+    }
+}
+
+fn reviewers_from(
+    latest: Vec<GqlLatestReview>,
+    requests: Vec<GqlReviewRequest>,
+) -> Vec<Reviewer> {
+    let mut reviewers: Vec<Reviewer> = latest
+        .into_iter()
+        .filter_map(|review| {
+            review.author.map(|author| Reviewer {
+                actor: author.into_actor(),
+                verdict: Some(map_review_verdict(&review.state)),
+            })
+        })
+        .collect();
+
+    for request in requests {
+        if let Some(reviewer) = request.requested_reviewer {
+            let actor = reviewer.into_actor();
+            if !reviewers.iter().any(|r| r.actor.login == actor.login) {
+                reviewers.push(Reviewer {
+                    actor,
+                    verdict: None,
+                });
+            }
+        }
+    }
+
+    reviewers
+}
+
+fn map_detail(detail: GqlPrDetail, owner: &str, repo: &str) -> PullRequest {
+    let (rollup_state, checks) = detail
+        .commits
+        .nodes
+        .into_iter()
+        .next()
+        .and_then(|node| node.commit.status_check_rollup)
+        .map(|rollup| {
+            let checks = rollup
+                .contexts
+                .nodes
+                .into_iter()
+                .map(GqlCheckContext::into_check)
+                .collect::<Vec<_>>();
+            (Some(map_status_state(Some(&rollup.state))), checks)
+        })
+        .unwrap_or((None, Vec::new()));
+
+    let body = detail.body.clone().unwrap_or_default();
+    let mergeable = detail.mergeable.as_deref().map(|m| m == "MERGEABLE");
+    let reviewers = reviewers_from(detail.latest_reviews.nodes, detail.review_requests.nodes);
+
+    PullRequest {
+        info: detail.info.into_info(owner, repo),
+        body: body.into(),
+        labels: detail
+            .labels
+            .nodes
+            .into_iter()
+            .map(|l| l.name.into())
+            .collect(),
+        assignees: detail
+            .assignees
+            .nodes
+            .into_iter()
+            .map(GqlActor::into_actor)
+            .collect(),
+        reviewers,
+        milestone: detail.milestone.map(|m| m.title.into()),
+        mergeable,
+        merge_state_status: detail.merge_state_status.map(Into::into),
+        checks,
+        check_rollup: rollup_state,
+        reactions: detail
+            .reaction_groups
+            .into_iter()
+            .map(GqlReactionGroup::into_group)
+            .collect(),
+        viewer_can_update: detail.viewer_can_update,
+        viewer_can_merge: detail.viewer_can_merge_as_admin,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trait implementation
+// ---------------------------------------------------------------------------
+
+impl PullRequestProvider for GitHubProvider {
     fn name(&self) -> &'static str {
         "GitHub"
     }
 
-    fn fetch_pull_requests(
-        &self,
-        owner: &str,
-        repo: &str,
-        state: PullRequestState,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<PullRequestInfo>>> + Send>> {
-        let state_param = match &state {
-            PullRequestState::Open => "open",
-            PullRequestState::Closed | PullRequestState::Merged => "closed",
-            PullRequestState::All => "all",
-        };
-        let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls?state={state_param}");
-        let http_client = self.http_client.clone();
-        let token = self.token.clone();
-        let owner = owner.to_string();
-        let repo = repo.to_string();
-
+    fn list_pull_requests<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+        query: &'a str,
+    ) -> ProviderFuture<'a, Vec<PullRequestInfo>> {
         Box::pin(async move {
-            let gh_prs: Vec<GhPullRequest> =
-                github_get_paginated(&http_client, &token, &url).await?;
-            let mut pull_requests = Vec::with_capacity(gh_prs.len());
+            let full_query = format!("repo:{owner}/{repo} is:pr {query}");
+            let data: ListData = execute(
+                &self.http_client,
+                self.token(),
+                &q::list_pull_requests(),
+                serde_json::json!({ "query": full_query }),
+            )
+            .await?;
+            Ok(data
+                .search
+                .nodes
+                .into_iter()
+                .filter_map(|node| serde_json::from_value::<GqlPrInfo>(node).ok())
+                .map(|info| info.into_info(owner, repo))
+                .collect())
+        })
+    }
 
-            for gh_pr in gh_prs {
-                let mut pull_request = map_pull_request(gh_pr);
-                if matches!(state, PullRequestState::Merged)
-                    && !matches!(pull_request.state, PullRequestState::Merged)
-                {
-                    continue;
+    fn fetch_pull_request<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+        number: u32,
+    ) -> ProviderFuture<'a, PullRequest> {
+        Box::pin(async move {
+            let data: RepoData<GqlPrDetail> = execute(
+                &self.http_client,
+                self.token(),
+                &q::pull_request(),
+                serde_json::json!({ "owner": owner, "name": repo, "number": number }),
+            )
+            .await?;
+            Ok(map_detail(data.repository.pull_request, owner, repo))
+        })
+    }
+
+    fn fetch_files<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+        number: u32,
+    ) -> ProviderFuture<'a, Vec<PullRequestFile>> {
+        Box::pin(async move {
+            let mut files = Vec::new();
+            let mut after: Option<String> = None;
+            loop {
+                let data: FilesData = execute(
+                    &self.http_client,
+                    self.token(),
+                    q::pull_request_files(),
+                    serde_json::json!({
+                        "owner": owner, "name": repo, "number": number, "after": after
+                    }),
+                )
+                .await?;
+                let connection = data.repository.pull_request.files;
+                for file in connection.nodes {
+                    files.push(PullRequestFile {
+                        path: file.path.into(),
+                        status: map_change_type(&file.change_type),
+                        additions: file.additions,
+                        deletions: file.deletions,
+                        viewed_state: map_viewed_state(&file.viewer_viewed_state),
+                    });
                 }
-                if matches!(state, PullRequestState::Closed)
-                    && matches!(pull_request.state, PullRequestState::Merged)
-                {
-                    continue;
-                }
-
-                pull_request.review_status =
-                    fetch_review_status(&http_client, &token, &owner, &repo, pull_request.number)
-                        .await
-                        .unwrap_or(ReviewStatus::Pending);
-                pull_requests.push(pull_request);
-            }
-
-            Ok(pull_requests)
-        })
-    }
-
-    fn fetch_pull_request_details(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: u32,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PullRequestDetails>> + Send>> {
-        let pr_url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}");
-        let files_url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/files");
-        let http_client = self.http_client.clone();
-        let token = self.token.clone();
-        let owner = owner.to_string();
-        let repo = repo.to_string();
-
-        Box::pin(async move {
-            let gh_pr: GhPullRequest = github_get(&http_client, &token, &pr_url).await?;
-            let gh_files: Vec<GhFile> =
-                github_get_paginated(&http_client, &token, &files_url).await?;
-            let review_status = fetch_review_status(&http_client, &token, &owner, &repo, number)
-                .await
-                .unwrap_or(ReviewStatus::Pending);
-            let mut info = map_pull_request(gh_pr);
-            info.review_status = review_status;
-
-            Ok(PullRequestDetails {
-                info,
-                files: gh_files.into_iter().map(map_file).collect(),
-                comments: Vec::new(),
-                checks: Vec::new(),
-                mergeable: None,
-                labels: Vec::new(),
-            })
-        })
-    }
-
-    fn fetch_pull_request_files(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: u32,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<PullRequestFile>>> + Send>> {
-        let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/files");
-        let http_client = self.http_client.clone();
-        let token = self.token.clone();
-
-        Box::pin(async move {
-            let gh_files: Vec<GhFile> = github_get_paginated(&http_client, &token, &url).await?;
-            Ok(gh_files.into_iter().map(map_file).collect())
-        })
-    }
-
-    fn fetch_reviews(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: u32,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<ReviewComment>>> + Send>> {
-        let comments_url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/comments");
-        let reviews_url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/reviews");
-        let http_client = self.http_client.clone();
-        let token = self.token.clone();
-
-        Box::pin(async move {
-            // Fetch inline code comments
-            let gh_comments: Vec<GhReviewComment> =
-                github_get_paginated(&http_client, &token, &comments_url).await?;
-
-            // Fetch top-level review submissions (approve, request changes, etc.)
-            let gh_reviews: Vec<GhReview> =
-                github_get_paginated(&http_client, &token, &reviews_url).await?;
-
-            let mut comments: Vec<ReviewComment> =
-                gh_comments.into_iter().map(map_review_comment).collect();
-
-            // Add review-level comments (non-empty body only)
-            for review in gh_reviews {
-                if let Some(body) = review.body {
-                    if !body.is_empty() {
-                        comments.push(ReviewComment {
-                            id: review.id,
-                            author: review.user.login.into(),
-                            body: body.into(),
-                            created_at: review.submitted_at.unwrap_or_default().into(),
-                            path: None,
-                            line: None,
-                            reply_to: None,
-                            diff_hunk: None,
-                        });
-                    }
+                if connection.page_info.has_next_page {
+                    after = connection.page_info.end_cursor;
+                } else {
+                    break;
                 }
             }
-
-            Ok(comments)
+            Ok(files)
         })
     }
 
-    fn submit_comment(
-        &self,
-        owner: &str,
-        repo: &str,
+    fn fetch_review_threads<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
         number: u32,
-        body: &str,
-        target: ReviewCommentTarget,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ReviewComment>> + Send>> {
-        let http_client = self.http_client.clone();
-        let token = self.token.clone();
-        let owner = owner.to_string();
-        let repo = repo.to_string();
-        let body = body.to_string();
-
+    ) -> ProviderFuture<'a, Vec<ReviewThread>> {
         Box::pin(async move {
-            match target {
-                ReviewCommentTarget::General => {
-                    let url =
-                        format!("{GITHUB_API_URL}/repos/{owner}/{repo}/issues/{number}/comments");
-                    let json = serde_json::json!({ "body": body }).to_string();
-                    let gh_comment: GhIssueComment =
-                        github_post(&http_client, &token, &url, json).await?;
-
-                    Ok(ReviewComment {
-                        id: gh_comment.id,
-                        author: gh_comment.user.login.into(),
-                        body: gh_comment.body.into(),
-                        created_at: gh_comment.created_at.into(),
-                        path: None,
-                        line: None,
-                        reply_to: None,
-                        diff_hunk: None,
-                    })
+            let mut threads = Vec::new();
+            let mut after: Option<String> = None;
+            let query = q::pull_request_threads();
+            loop {
+                let data: ThreadsData = execute(
+                    &self.http_client,
+                    self.token(),
+                    &query,
+                    serde_json::json!({
+                        "owner": owner, "name": repo, "number": number, "after": after
+                    }),
+                )
+                .await?;
+                let connection = data.repository.pull_request.review_threads;
+                for thread in connection.nodes {
+                    threads.push(thread.into_thread());
                 }
-                ReviewCommentTarget::NewThread {
+                if connection.page_info.has_next_page {
+                    after = connection.page_info.end_cursor;
+                } else {
+                    break;
+                }
+            }
+            Ok(threads)
+        })
+    }
+
+    fn fetch_timeline<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+        number: u32,
+    ) -> ProviderFuture<'a, Vec<TimelineItem>> {
+        Box::pin(async move {
+            let data: TimelineData = execute(
+                &self.http_client,
+                self.token(),
+                q::pull_request_timeline(),
+                serde_json::json!({ "owner": owner, "name": repo, "number": number }),
+            )
+            .await?;
+            Ok(data
+                .repository
+                .pull_request
+                .timeline_items
+                .nodes
+                .into_iter()
+                .map(GqlTimelineItem::into_item)
+                .collect())
+        })
+    }
+
+    fn mark_file_viewed<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        path: &'a str,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::mark_file_as_viewed(),
+                serde_json::json!({ "pullRequestId": pull_request_node_id, "path": path }),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn unmark_file_viewed<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        path: &'a str,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::unmark_file_as_viewed(),
+                serde_json::json!({ "pullRequestId": pull_request_node_id, "path": path }),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn pending_review_id<'a>(
+        &'a self,
+        owner: &'a str,
+        repo: &'a str,
+        number: u32,
+    ) -> ProviderFuture<'a, Option<SharedString>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct Data {
+                repository: RepoPullRequest<Reviews>,
+            }
+            #[derive(Deserialize)]
+            struct Reviews {
+                reviews: GqlNodes<IdNode>,
+            }
+            #[derive(Deserialize)]
+            struct IdNode {
+                id: String,
+            }
+            let data: Data = execute(
+                &self.http_client,
+                self.token(),
+                q::pending_review_id(),
+                serde_json::json!({ "owner": owner, "name": repo, "number": number }),
+            )
+            .await?;
+            Ok(data
+                .repository
+                .pull_request
+                .reviews
+                .nodes
+                .into_iter()
+                .next()
+                .map(|node| node.id.into()))
+        })
+    }
+
+    fn start_review<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+    ) -> ProviderFuture<'a, SharedString> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Data {
+                add_pull_request_review: ReviewWrap,
+            }
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct ReviewWrap {
+                pull_request_review: IdNode,
+            }
+            #[derive(Deserialize)]
+            struct IdNode {
+                id: String,
+            }
+            let data: Data = execute(
+                &self.http_client,
+                self.token(),
+                q::start_review(),
+                serde_json::json!({ "pullRequestId": pull_request_node_id }),
+            )
+            .await?;
+            Ok(data.add_pull_request_review.pull_request_review.id.into())
+        })
+    }
+
+    fn add_comment<'a>(
+        &'a self,
+        comment: &'a NewComment,
+    ) -> ProviderFuture<'a, Option<ReviewThread>> {
+        Box::pin(async move {
+            match &comment.target {
+                CommentTarget::NewThread {
                     path,
+                    side,
                     line,
-                    commit_sha,
+                    start_line,
                 } => {
-                    let url =
-                        format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/comments");
-                    let json = serde_json::json!({
-                        "body": body,
-                        "commit_id": commit_sha,
-                        "path": path,
-                        "line": line,
-                        "side": "RIGHT",
-                    })
-                    .to_string();
-                    let gh_comment: GhReviewComment =
-                        github_post(&http_client, &token, &url, json).await?;
-
-                    Ok(map_review_comment(gh_comment))
+                    #[derive(Deserialize)]
+                    #[serde(rename_all = "camelCase")]
+                    struct Data {
+                        add_pull_request_review_thread: ThreadWrap,
+                    }
+                    #[derive(Deserialize)]
+                    struct ThreadWrap {
+                        thread: GqlThread,
+                    }
+                    let side = match side {
+                        DiffSide::Left => "LEFT",
+                        DiffSide::Right => "RIGHT",
+                    };
+                    let data: Data = execute(
+                        &self.http_client,
+                        self.token(),
+                        &q::add_review_thread(),
+                        serde_json::json!({
+                            "pullRequestId": comment.pull_request.node_id,
+                            "body": comment.body,
+                            "path": path,
+                            "line": line,
+                            "startLine": start_line,
+                            "side": side,
+                            "startSide": start_line.map(|_| side),
+                            "reviewId": comment.review_id,
+                        }),
+                    )
+                    .await?;
+                    Ok(Some(data.add_pull_request_review_thread.thread.into_thread()))
                 }
-                ReviewCommentTarget::Reply { in_reply_to } => {
-                    let url = format!(
-                        "{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/comments/{in_reply_to}/replies"
-                    );
-                    let json = serde_json::json!({ "body": body }).to_string();
-                    let gh_comment: GhReviewComment =
-                        github_post(&http_client, &token, &url, json).await?;
-
-                    Ok(map_review_comment(gh_comment))
+                CommentTarget::Reply { in_reply_to } => {
+                    let review_id = match &comment.review_id {
+                        Some(id) => id.clone(),
+                        None => self.start_review(&comment.pull_request.node_id).await?,
+                    };
+                    let _: serde_json::Value = execute(
+                        &self.http_client,
+                        self.token(),
+                        &q::add_review_comment(),
+                        serde_json::json!({
+                            "reviewId": review_id,
+                            "body": comment.body,
+                            "inReplyTo": in_reply_to,
+                        }),
+                    )
+                    .await?;
+                    Ok(None)
                 }
             }
         })
     }
 
-    fn submit_review(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: u32,
-        status: ReviewStatus,
-        body: Option<&str>,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
-        let event = match status {
-            ReviewStatus::Approved => "APPROVE",
-            ReviewStatus::ChangesRequested => "REQUEST_CHANGES",
-            ReviewStatus::Commented => "COMMENT",
-            ReviewStatus::Pending => "PENDING",
-        };
-        let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/reviews");
-        let json = serde_json::json!({
-            "event": event,
-            "body": body.unwrap_or(""),
-        })
-        .to_string();
-        let http_client = self.http_client.clone();
-        let token = self.token.clone();
-
+    fn edit_comment<'a>(
+        &'a self,
+        comment_node_id: &'a str,
+        body: &'a str,
+    ) -> ProviderFuture<'a, ReviewComment> {
         Box::pin(async move {
-            let _: serde_json::Value = github_post(&http_client, &token, &url, json).await?;
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Data {
+                update_pull_request_review_comment: CommentWrap,
+            }
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct CommentWrap {
+                pull_request_review_comment: GqlComment,
+            }
+            let data: Data = execute(
+                &self.http_client,
+                self.token(),
+                &q::edit_comment(),
+                serde_json::json!({ "id": comment_node_id, "body": body }),
+            )
+            .await?;
+            Ok(data
+                .update_pull_request_review_comment
+                .pull_request_review_comment
+                .into_comment())
+        })
+    }
+
+    fn submit_review<'a>(
+        &'a self,
+        review_node_id: &'a str,
+        event: ReviewEvent,
+        body: &'a str,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let body = if body.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(body.to_string())
+            };
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::submit_review(),
+                serde_json::json!({
+                    "reviewId": review_node_id,
+                    "event": event.graphql(),
+                    "body": body,
+                }),
+            )
+            .await?;
             Ok(())
         })
     }
 
-    fn merge_pull_request(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: u32,
-        merge_method: MergeMethod,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
-        let method = match merge_method {
-            MergeMethod::Merge => "merge",
-            MergeMethod::Squash => "squash",
-            MergeMethod::Rebase => "rebase",
-        };
-        let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/merge");
-        let json = serde_json::json!({ "merge_method": method }).to_string();
-        let http_client = self.http_client.clone();
-        let token = self.token.clone();
-
+    fn delete_review<'a>(&'a self, review_node_id: &'a str) -> ProviderFuture<'a, ()> {
         Box::pin(async move {
-            let mut builder = http_client::Request::builder()
-                .method(http_client::Method::PUT)
-                .uri(&url)
-                .header("Accept", "application/vnd.github.v3+json")
-                .header("Content-Type", "application/json")
-                .follow_redirects(RedirectPolicy::FollowAll);
-
-            if let Some(token) = &token {
-                builder = builder.header("Authorization", format!("Bearer {}", token));
-            }
-
-            let request = builder.body(AsyncBody::from(json))?;
-            let mut response = http_client.send(request).await?;
-
-            let mut body = Vec::new();
-            response.body_mut().read_to_end(&mut body).await?;
-
-            if !response.status().is_success() {
-                let text = String::from_utf8_lossy(&body);
-                bail!(
-                    "GitHub merge error {}: {}",
-                    response.status().as_u16(),
-                    text
-                );
-            }
-
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::delete_review(),
+                serde_json::json!({ "reviewId": review_node_id }),
+            )
+            .await?;
             Ok(())
+        })
+    }
+
+    fn resolve_thread<'a>(&'a self, thread_node_id: &'a str) -> ProviderFuture<'a, ReviewThread> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Data {
+                resolve_review_thread: ThreadWrap,
+            }
+            #[derive(Deserialize)]
+            struct ThreadWrap {
+                thread: GqlThread,
+            }
+            let data: Data = execute(
+                &self.http_client,
+                self.token(),
+                &q::resolve_thread(),
+                serde_json::json!({ "threadId": thread_node_id }),
+            )
+            .await?;
+            Ok(data.resolve_review_thread.thread.into_thread())
+        })
+    }
+
+    fn unresolve_thread<'a>(&'a self, thread_node_id: &'a str) -> ProviderFuture<'a, ReviewThread> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Data {
+                unresolve_review_thread: ThreadWrap,
+            }
+            #[derive(Deserialize)]
+            struct ThreadWrap {
+                thread: GqlThread,
+            }
+            let data: Data = execute(
+                &self.http_client,
+                self.token(),
+                &q::unresolve_thread(),
+                serde_json::json!({ "threadId": thread_node_id }),
+            )
+            .await?;
+            Ok(data.unresolve_review_thread.thread.into_thread())
+        })
+    }
+
+    fn add_reaction<'a>(
+        &'a self,
+        subject_node_id: &'a str,
+        content: &'a str,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::add_reaction(),
+                serde_json::json!({ "subjectId": subject_node_id, "content": content }),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn remove_reaction<'a>(
+        &'a self,
+        subject_node_id: &'a str,
+        content: &'a str,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::remove_reaction(),
+                serde_json::json!({ "subjectId": subject_node_id, "content": content }),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn merge_pull_request<'a>(
+        &'a self,
+        pull_request_node_id: &'a str,
+        method: MergeMethod,
+        commit_headline: Option<&'a str>,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let _: serde_json::Value = execute(
+                &self.http_client,
+                self.token(),
+                q::merge_pull_request(),
+                serde_json::json!({
+                    "pullRequestId": pull_request_node_id,
+                    "method": method.graphql(),
+                    "headline": commit_headline,
+                }),
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn create_pull_request<'a>(
+        &'a self,
+        input: &'a CreatePullRequest,
+    ) -> ProviderFuture<'a, PullRequestInfo> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct RepoIdData {
+                repository: IdNode,
+            }
+            #[derive(Deserialize)]
+            struct IdNode {
+                id: String,
+            }
+            let repo_id: RepoIdData = execute(
+                &self.http_client,
+                self.token(),
+                q::repository_id(),
+                serde_json::json!({ "owner": input.owner, "name": input.repo }),
+            )
+            .await?;
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Data {
+                create_pull_request: PrWrap,
+            }
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct PrWrap {
+                pull_request: GqlPrInfo,
+            }
+            let data: Data = execute(
+                &self.http_client,
+                self.token(),
+                &q::create_pull_request(),
+                serde_json::json!({
+                    "repositoryId": repo_id.repository.id,
+                    "base": input.base_ref,
+                    "head": input.head_ref,
+                    "title": input.title,
+                    "body": input.body,
+                    "draft": input.draft,
+                }),
+            )
+            .await?;
+            Ok(data
+                .create_pull_request
+                .pull_request
+                .into_info(&input.owner, &input.repo))
         })
     }
 }

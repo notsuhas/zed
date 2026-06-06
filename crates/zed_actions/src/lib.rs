@@ -729,13 +729,13 @@ pub mod outline {
     pub static TOGGLE_OUTLINE: OnceLock<fn(AnyView, &mut Window, &mut App)> = OnceLock::new();
 }
 
-pub mod review_panel {
+pub mod pull_request {
     use gpui::actions;
 
     actions!(
-        review_ui,
+        pull_request,
         [
-            /// Toggles focus on the review UI.
+            /// Toggles focus on the Pull Requests panel.
             ToggleFocus,
             /// Opens the selected file in the editor (working tree version).
             OpenLocalFile

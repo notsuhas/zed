@@ -1,25 +1,26 @@
-mod comment_card;
-mod file_list;
+//! Native Pull Requests panel: browse, review, and act on GitHub pull
+//! requests without leaving the editor.
+//!
+//! - `provider` — forge-agnostic review API (trait + domain types).
+//! - `github_*` — the GitHub GraphQL implementation of that API.
+//! - `pull_request_panel` — the dock panel and its sub-views.
+
+mod github_graphql;
 mod github_provider;
+mod github_queries;
 mod github_token;
-mod inline_comment;
-mod pull_request_list;
-mod review_panel;
+mod provider;
+mod pull_request_panel;
 mod review_panel_settings;
-mod review_provider;
-mod review_view;
 
-pub use review_panel::ReviewPanel;
-
-#[cfg(feature = "test-support")]
-pub mod test_support;
+pub use pull_request_panel::PullRequestPanel;
 
 use gpui::App;
 use workspace::Workspace;
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
-        review_panel::register(workspace);
+        pull_request_panel::register(workspace);
     })
     .detach();
 }
