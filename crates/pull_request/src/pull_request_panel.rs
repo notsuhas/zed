@@ -482,6 +482,32 @@ impl PullRequestPanel {
         .detach();
     }
 
+    fn merge_selected(&mut self, method: MergeMethod, cx: &mut Context<Self>) {
+        let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
+            return;
+        };
+        let node_id = loaded.detail.info.id.node_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = provider.merge_pull_request(&node_id, method, None).await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.refresh_detail(cx),
+                    Err(error) => this.detail_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Re-fetch the full detail for the selected PR (after a state change).
+    fn refresh_detail(&mut self, cx: &mut Context<Self>) {
+        if let Some(loaded) = self.selected.as_ref() {
+            self.select_pull_request(loaded.detail.info.clone(), cx);
+        }
+    }
+
     fn submit_review(&mut self, event: ReviewEvent, cx: &mut Context<Self>) {
         let (Some(provider), Some(loaded)) = (self.provider.clone(), self.selected.as_ref()) else {
             return;
@@ -747,6 +773,21 @@ impl PullRequestPanel {
                             .on_click(cx.listener(|this, _, _window, cx| {
                                 this.submit_review(ReviewEvent::Comment, cx)
                             })),
+                    )
+                    .when(
+                        detail.viewer_can_merge
+                            && info.state == PullRequestState::Open
+                            && !info.is_draft,
+                        |this| {
+                            this.child(
+                                ui::Button::new("merge", "Squash & merge")
+                                    .label_size(LabelSize::Small)
+                                    .style(ButtonStyle::Filled)
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.merge_selected(MergeMethod::Squash, cx)
+                                    })),
+                            )
+                        },
                     ),
             )
     }

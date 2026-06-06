@@ -93,13 +93,24 @@ updates (e.g. viewed checkbox) revert on error.
 - [ ] PR overview: description, labels, milestone, assignees, reviewers, request reviewers
 - [ ] Checks / CI status (incl. required)
 - [ ] Merge (methods) / close / reopen / draft / auto-merge
-- [ ] Files changed: tree/flat, viewed sync, decorations, open diff
-- [ ] Inline comments: add/reply/edit/delete, multi-line, left/right side
-- [ ] Threads: resolve/unresolve, outdated handling
-- [ ] Reactions / emoji
+- [x] PR list: query categories (open/to-review/assigned/created)
+- [x] PR overview: state/draft, branches, labels, reviewers + verdicts, checks, mergeable
+- [x] Checks / CI status rollup (overview)
+- [x] Merge (squash) — gated on viewer_can_merge
+- [x] Files changed: tree/flat toggle, server-synced viewed checkboxes, +/- decorations
+- [x] Inline comments: reply composer (new-thread + reply provider paths exist)
+- [x] Threads: resolve/unresolve (permission-gated), outdated/resolved badges
+- [x] Reactions / emoji (display)
+- [x] Review submission: comment/approve/request-changes (reuses pending review)
+- [x] Timeline / activity
+- [x] Diff-position mapping (line + hunk based) with tests
+
+Remaining toward full parity (not yet built):
+- [ ] Open file diff in the multibuffer + render threads inline at mapped rows
+- [ ] Comment edit/delete; add-reaction (write); single-comment vs batched review toggle
 - [ ] Suggested changes: render + apply
-- [ ] Review submission: pending batching, comment/approve/request-changes, single comment
-- [ ] Timeline / activity
-- [ ] Create PR flow
-- [ ] @mention / issue autocomplete (stretch)
-- [ ] Notifications / badges (stretch)
+- [ ] Create PR flow (provider method exists; no form UI yet)
+- [ ] Edit title/body/labels/assignees/milestone; request reviewers; close/reopen/draft
+- [ ] Auto-merge / merge queue; choose merge method
+- [ ] @mention / issue autocomplete; notifications / badges (stretch)
+- [ ] Rename settings block review_panel → pull_request (cosmetic)
