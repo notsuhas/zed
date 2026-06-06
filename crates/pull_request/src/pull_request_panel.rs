@@ -131,6 +131,7 @@ pub struct PullRequestPanel {
     detail_error: Option<SharedString>,
     detail_loading: bool,
     file_layout: FileLayout,
+    hide_viewed: bool,
     collapsed_dirs: HashSet<String>,
     comment_editor: Entity<Editor>,
     composer_target: Option<ComposerTarget>,
@@ -252,6 +253,7 @@ impl PullRequestPanel {
             detail_error: None,
             detail_loading: false,
             file_layout: FileLayout::Tree,
+            hide_viewed: false,
             collapsed_dirs: HashSet::new(),
             comment_editor,
             composer_target: None,
@@ -1432,12 +1434,28 @@ impl PullRequestPanel {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let layout = self.file_layout;
+        let hide_viewed = self.hide_viewed;
+        let visible: Vec<PullRequestFile> = loaded
+            .files
+            .iter()
+            .filter(|file| !hide_viewed || file.viewed_state != ViewedState::Viewed)
+            .cloned()
+            .collect();
         let header = h_flex()
             .justify_between()
             .child(Label::new(format!("{} files", loaded.files.len())).size(LabelSize::Small))
             .child(
                 h_flex()
                     .gap_1()
+                    .child(
+                        IconButton::new("hide-viewed", IconName::Eye)
+                            .toggle_state(hide_viewed)
+                            .tooltip(Tooltip::text("Hide viewed files"))
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.hide_viewed = !this.hide_viewed;
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         IconButton::new("layout-tree", IconName::ListTree)
                             .toggle_state(layout == FileLayout::Tree)
@@ -1461,20 +1479,19 @@ impl PullRequestPanel {
         let rows = match layout {
             FileLayout::Flat => v_flex()
                 .children(
-                    loaded
-                        .files
+                    visible
                         .iter()
                         .map(|file| self.render_file_row(file, file.path.to_string(), 0, cx)),
                 )
                 .into_any_element(),
             FileLayout::Tree => {
-                let tree_rows = build_tree_rows(&loaded.files, &self.collapsed_dirs);
+                let tree_rows = build_tree_rows(&visible, &self.collapsed_dirs);
                 v_flex()
                     .children(tree_rows.into_iter().map(|row| {
                         if row.is_dir {
                             self.render_dir_row(row.depth, row.name, row.dir_path, cx)
                                 .into_any_element()
-                        } else if let Some(file) = row.file_index.and_then(|i| loaded.files.get(i)) {
+                        } else if let Some(file) = row.file_index.and_then(|i| visible.get(i)) {
                             self.render_file_row(file, row.name, row.depth, cx)
                                 .into_any_element()
                         } else {
@@ -1526,12 +1543,14 @@ impl PullRequestPanel {
         let viewed = file.viewed_state == ViewedState::Viewed;
         let path = file.path.clone();
         let open_path = file.path.clone();
+        let github_path = file.path.clone();
+        let (badge, badge_color) = file_status_badge(&file.status);
         h_flex()
             .w_full()
             .py_0p5()
             .pl(px(8.0 + depth as f32 * 12.0))
             .pr_2()
-            .gap_2()
+            .gap_1()
             .child(
                 Checkbox::new(
                     SharedString::from(format!("viewed:{path}")),
@@ -1541,9 +1560,11 @@ impl PullRequestPanel {
                     this.toggle_file_viewed(path.clone(), cx)
                 })),
             )
+            .child(Label::new(badge).size(LabelSize::XSmall).color(badge_color))
             .child(
                 div()
                     .id(SharedString::from(format!("open:{open_path}")))
+                    .flex_1()
                     .cursor_pointer()
                     .child(Label::new(display).size(LabelSize::Small).color(if viewed {
                         Color::Muted
@@ -1559,6 +1580,29 @@ impl PullRequestPanel {
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
+            .child(
+                IconButton::new(
+                    SharedString::from(format!("gh:{github_path}")),
+                    IconName::Github,
+                )
+                .icon_size(IconSize::XSmall)
+                .tooltip(Tooltip::text("Open on GitHub"))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.open_file_on_github(github_path.clone(), cx)
+                })),
+            )
+    }
+
+    fn open_file_on_github(&self, path: SharedString, cx: &mut Context<Self>) {
+        let Some(loaded) = self.selected.as_ref() else {
+            return;
+        };
+        let info = &loaded.detail.info;
+        let url = format!(
+            "https://github.com/{}/{}/blob/{}/{}",
+            info.id.owner, info.id.repo, info.head_sha, path
+        );
+        cx.open_url(&url);
     }
 
     fn render_threads(&self, loaded: &LoadedPullRequest, cx: &Context<Self>) -> impl IntoElement {
@@ -2078,6 +2122,17 @@ fn render_inline_thread(thread: &ReviewThread, cx: &mut BlockContext) -> gpui::A
                 .child(Label::new(comment.body.clone()).size(LabelSize::Small))
         }))
         .into_any_element()
+}
+
+/// One-letter status badge + color for a changed file.
+fn file_status_badge(status: &FileChangeStatus) -> (&'static str, Color) {
+    match status {
+        FileChangeStatus::Added => ("A", Color::Success),
+        FileChangeStatus::Modified => ("M", Color::Warning),
+        FileChangeStatus::Deleted => ("D", Color::Error),
+        FileChangeStatus::Renamed { .. } => ("R", Color::Accent),
+        FileChangeStatus::Copied { .. } => ("C", Color::Accent),
+    }
 }
 
 /// Icon/color/label for an aggregate CI status.
