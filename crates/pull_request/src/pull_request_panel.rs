@@ -107,6 +107,7 @@ enum ActiveView {
     Detail,
     Create,
     Fields,
+    Notifications,
 }
 
 pub struct PullRequestPanel {
@@ -151,6 +152,7 @@ pub struct PullRequestPanel {
     repo_labels: Vec<Candidate>,
     repo_users: Vec<Candidate>,
     repo_milestones: Vec<Candidate>,
+    notifications: Vec<Notification>,
     search_editor: Entity<Editor>,
     _refresh_task: Option<Task<()>>,
     _detail_task: Option<Task<()>>,
@@ -279,6 +281,7 @@ impl PullRequestPanel {
             repo_labels: Vec::new(),
             repo_users: Vec::new(),
             repo_milestones: Vec::new(),
+            notifications: Vec::new(),
             search_editor,
             _refresh_task: None,
             _detail_task: None,
@@ -979,6 +982,64 @@ impl PullRequestPanel {
         .detach();
     }
 
+    fn open_notifications(&mut self, cx: &mut Context<Self>) {
+        let Some(provider) = self.provider.clone() else {
+            return;
+        };
+        self.active_view = ActiveView::Notifications;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let notifications = provider.fetch_notifications().await.unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.notifications = notifications;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn render_notifications(&self, cx: &Context<Self>) -> impl IntoElement {
+        let header = h_flex()
+            .gap_1()
+            .p_2()
+            .child(
+                IconButton::new("notif-back", IconName::ArrowLeft)
+                    .tooltip(Tooltip::text("Back to list"))
+                    .on_click(cx.listener(|this, _, _window, cx| this.back_to_list(cx))),
+            )
+            .child(Label::new("Notifications").size(LabelSize::Small));
+
+        let body = if self.notifications.is_empty() {
+            v_flex()
+                .p_4()
+                .child(Label::new("No unread notifications.").color(Color::Muted))
+                .into_any_element()
+        } else {
+            v_flex()
+                .id("notif-list")
+                .overflow_y_scroll()
+                .children(self.notifications.iter().map(|notification| {
+                    v_flex()
+                        .px_2()
+                        .py_1()
+                        .gap_0p5()
+                        .child(Label::new(notification.title.clone()).size(LabelSize::Small))
+                        .child(
+                            Label::new(format!(
+                                "{} · {} · {}",
+                                notification.repository, notification.kind, notification.reason
+                            ))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                }))
+                .into_any_element()
+        };
+
+        v_flex().size_full().child(header).child(body)
+    }
+
     fn open_fields(&mut self, cx: &mut Context<Self>) {
         let (Some(provider), Some(owner), Some(repo)) =
             (self.provider.clone(), self.owner.clone(), self.repo.clone())
@@ -1309,6 +1370,13 @@ impl PullRequestPanel {
             .child(
                 h_flex()
                     .gap_1()
+                    .child(
+                        IconButton::new("notifications", IconName::Bell)
+                            .tooltip(Tooltip::text("Notifications"))
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.open_notifications(cx)
+                            })),
+                    )
                     .child(
                         IconButton::new("create-pr", IconName::Plus)
                             .tooltip(Tooltip::text("New pull request"))
@@ -2650,6 +2718,7 @@ impl Render for PullRequestPanel {
             ActiveView::Detail => self.render_detail(cx).into_any_element(),
             ActiveView::Create => self.render_create(cx).into_any_element(),
             ActiveView::Fields => self.render_fields(cx).into_any_element(),
+            ActiveView::Notifications => self.render_notifications(cx).into_any_element(),
         };
         v_flex()
             .key_context("PullRequestPanel")

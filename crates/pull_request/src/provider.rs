@@ -308,6 +308,15 @@ pub struct NewComment {
     pub commit_sha: SharedString,
 }
 
+/// A GitHub notification thread.
+#[derive(Clone, Debug)]
+pub struct Notification {
+    pub title: SharedString,
+    pub reason: SharedString,
+    pub repository: SharedString,
+    pub kind: SharedString,
+}
+
 /// A selectable candidate (label, user, milestone) with its node id + display.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
@@ -457,6 +466,9 @@ pub trait PullRequestProvider: Send + Sync {
         subject_node_id: &'a str,
         content: &'a str,
     ) -> ProviderFuture<'a, ()>;
+
+    /// Fetch the viewer's unread notifications.
+    fn fetch_notifications<'a>(&'a self) -> ProviderFuture<'a, Vec<Notification>>;
 
     /// Candidate labels for the repo.
     fn fetch_labels<'a>(

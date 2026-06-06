@@ -1151,6 +1151,57 @@ impl PullRequestProvider for GitHubProvider {
         })
     }
 
+    fn fetch_notifications<'a>(&'a self) -> ProviderFuture<'a, Vec<Notification>> {
+        Box::pin(async move {
+            #[derive(Deserialize)]
+            struct GhNotification {
+                reason: String,
+                subject: GhSubject,
+                repository: GhRepo,
+            }
+            #[derive(Deserialize)]
+            struct GhSubject {
+                title: String,
+                #[serde(rename = "type")]
+                kind: String,
+            }
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct GhRepo {
+                full_name: String,
+            }
+
+            let url = format!("{GITHUB_REST_URL}/notifications");
+            let mut builder = Request::get(&url)
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", "Zed");
+            if let Some(token) = self.token() {
+                builder = builder.header("Authorization", format!("Bearer {token}"));
+            }
+            let request = builder.body(AsyncBody::default())?;
+            let mut response = self.http_client.send(request).await?;
+            let mut body = Vec::new();
+            response.body_mut().read_to_end(&mut body).await?;
+            if !response.status().is_success() {
+                bail!(
+                    "GitHub REST notifications {}: {}",
+                    response.status().as_u16(),
+                    String::from_utf8_lossy(&body)
+                );
+            }
+            let notifications: Vec<GhNotification> = serde_json::from_slice(&body)?;
+            Ok(notifications
+                .into_iter()
+                .map(|notification| Notification {
+                    title: notification.subject.title.into(),
+                    reason: notification.reason.into(),
+                    repository: notification.repository.full_name.into(),
+                    kind: notification.subject.kind.into(),
+                })
+                .collect())
+        })
+    }
+
     fn fetch_labels<'a>(
         &'a self,
         owner: &'a str,
