@@ -140,6 +140,7 @@ pub struct PullRequestPanel {
     create_head: Entity<Editor>,
     create_draft: bool,
     create_error: Option<SharedString>,
+    search_editor: Entity<Editor>,
     _refresh_task: Option<Task<()>>,
     _detail_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -224,6 +225,11 @@ impl PullRequestPanel {
         });
         let create_base = cx.new(|cx| Editor::single_line(window, cx));
         let create_head = cx.new(|cx| Editor::single_line(window, cx));
+        let search_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search (e.g. is:merged author:me)", window, cx);
+            editor
+        });
 
         let mut this = Self {
             workspace: weak_workspace,
@@ -255,6 +261,7 @@ impl PullRequestPanel {
             create_head,
             create_draft: false,
             create_error: None,
+            search_editor,
             _refresh_task: None,
             _detail_task: None,
             _subscriptions: vec![subscription],
@@ -311,7 +318,12 @@ impl PullRequestPanel {
         else {
             return;
         };
-        let query = self.filter.query().to_string();
+        let search = self.search_editor.read(cx).text(cx);
+        let query = if search.trim().is_empty() {
+            self.filter.query().to_string()
+        } else {
+            format!("{} {}", self.filter.query(), search.trim())
+        };
         self.list_loading = true;
         self.list_error = None;
         cx.notify();
@@ -1007,6 +1019,17 @@ impl PullRequestPanel {
                     ),
             );
 
+        let search_row = h_flex()
+            .px_2()
+            .pb_1()
+            .gap_1()
+            .child(div().flex_1().child(self.search_editor.clone()))
+            .child(
+                IconButton::new("search-go", IconName::MagnifyingGlass)
+                    .tooltip(Tooltip::text("Search"))
+                    .on_click(cx.listener(|this, _, _window, cx| this.refresh_list(cx))),
+            );
+
         let auth_status = h_flex().px_2().pb_1().child(
             Label::new(format!("Auth: {}", self.auth_source.label()))
                 .size(LabelSize::XSmall)
@@ -1044,6 +1067,7 @@ impl PullRequestPanel {
         v_flex()
             .size_full()
             .child(filters)
+            .child(search_row)
             .child(auth_status)
             .child(body)
     }
