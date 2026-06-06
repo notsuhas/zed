@@ -99,7 +99,7 @@ use {
     agent_servers::{AgentServer, AgentServerDelegate},
     anyhow::{Context as _, Result},
     assets::Assets,
-    editor::{Editor, display_map::DisplayRow},
+    editor::display_map::DisplayRow,
     feature_flags::FeatureFlagAppExt as _,
     git_ui::project_diff::ProjectDiff,
     gpui::{
@@ -3345,5 +3345,251 @@ fn run_sidebar_duplicate_project_names_visual_tests(
         Ok(TestResult::BaselineUpdated(path))
     } else {
         Ok(TestResult::Passed)
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct ErrorWrappingTestView;
+
+#[cfg(target_os = "macos")]
+impl gpui::Render for ErrorWrappingTestView {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use ui::{Button, Callout, IconName, LabelSize, Severity, prelude::*, v_flex};
+
+        let long_error_message = "Rate limit reached for gpt-5.2-codex in organization \
+            org-QmYpir6k6dkULKU1XUSN6pal on tokens per min (TPM): Limit 500000, Used 442480, \
+            Requested 59724. Please try again in 264ms. Visit \
+            https://platform.openai.com/account/rate-limits to learn more.";
+
+        let retry_description = "Retrying. Next attempt in 4 seconds (Attempt 1 of 2).";
+
+        v_flex()
+            .size_full()
+            .bg(cx.theme().colors().background)
+            .p_4()
+            .gap_4()
+            .child(
+                Callout::new()
+                    .icon(IconName::Warning)
+                    .severity(Severity::Warning)
+                    .title(long_error_message)
+                    .description(retry_description),
+            )
+            .child(
+                Callout::new()
+                    .severity(Severity::Error)
+                    .icon(IconName::XCircle)
+                    .title("An Error Happened")
+                    .description(long_error_message)
+                    .actions_slot(Button::new("dismiss", "Dismiss").label_size(LabelSize::Small)),
+            )
+            .child(
+                Callout::new()
+                    .severity(Severity::Error)
+                    .icon(IconName::XCircle)
+                    .title(long_error_message)
+                    .actions_slot(Button::new("retry", "Retry").label_size(LabelSize::Small)),
+            )
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct ThreadItemBranchNameTestView;
+
+#[cfg(target_os = "macos")]
+impl gpui::Render for ThreadItemBranchNameTestView {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use ui::{
+            IconName, Label, LabelSize, ThreadItem, ThreadItemWorktreeInfo, WorktreeKind,
+            prelude::*,
+        };
+
+        let section_label = |text: &str| {
+            Label::new(text.to_string())
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+        };
+
+        let container = || {
+            v_flex()
+                .w_80()
+                .border_1()
+                .border_color(cx.theme().colors().border_variant)
+                .bg(cx.theme().colors().panel_background)
+        };
+
+        v_flex()
+            .size_full()
+            .bg(cx.theme().colors().background)
+            .p_4()
+            .gap_3()
+            .child(
+                Label::new("ThreadItem Branch Names")
+                    .size(LabelSize::Large)
+                    .color(Color::Default),
+            )
+            .child(section_label(
+                "Linked worktree with branch (worktree / branch)",
+            ))
+            .child(
+                container().child(
+                    ThreadItem::new("ti-linked-branch", "Fix scrolling behavior")
+                        .icon(IconName::AiClaude)
+                        .timestamp("5m")
+                        .worktrees(vec![ThreadItemWorktreeInfo {
+                            worktree_name: Some("jade-glen".into()),
+                            full_path: "/worktrees/jade-glen/zed".into(),
+                            highlight_positions: Vec::new(),
+                            kind: WorktreeKind::Linked,
+                            branch_name: Some("fix-scrolling".into()),
+                        }]),
+                ),
+            )
+            .child(section_label(
+                "Linked worktree without branch (detached HEAD)",
+            ))
+            .child(
+                container().child(
+                    ThreadItem::new("ti-linked-no-branch", "Review worktree cleanup")
+                        .icon(IconName::AiClaude)
+                        .timestamp("1h")
+                        .worktrees(vec![ThreadItemWorktreeInfo {
+                            worktree_name: Some("focal-arrow".into()),
+                            full_path: "/worktrees/focal-arrow/zed".into(),
+                            highlight_positions: Vec::new(),
+                            kind: WorktreeKind::Linked,
+                            branch_name: None,
+                        }]),
+                ),
+            )
+            .child(section_label("Main worktree with branch (nothing shown)"))
+            .child(
+                container().child(
+                    ThreadItem::new("ti-main-branch", "Request for Long Classic Poem")
+                        .icon(IconName::ZedAgent)
+                        .timestamp("2d")
+                        .worktrees(vec![ThreadItemWorktreeInfo {
+                            worktree_name: Some("zed".into()),
+                            full_path: "/projects/zed".into(),
+                            highlight_positions: Vec::new(),
+                            kind: WorktreeKind::Main,
+                            branch_name: Some("main".into()),
+                        }]),
+                ),
+            )
+            .child(section_label(
+                "Main worktree without branch (nothing shown)",
+            ))
+            .child(
+                container().child(
+                    ThreadItem::new("ti-main-no-branch", "Simple greeting thread")
+                        .icon(IconName::ZedAgent)
+                        .timestamp("3d")
+                        .worktrees(vec![ThreadItemWorktreeInfo {
+                            worktree_name: Some("zed".into()),
+                            full_path: "/projects/zed".into(),
+                            highlight_positions: Vec::new(),
+                            kind: WorktreeKind::Main,
+                            branch_name: None,
+                        }]),
+                ),
+            )
+            .child(section_label("Linked worktree where name matches branch"))
+            .child(
+                container().child(
+                    ThreadItem::new("ti-same-name", "Implement feature")
+                        .icon(IconName::AiClaude)
+                        .timestamp("6d")
+                        .worktrees(vec![ThreadItemWorktreeInfo {
+                            worktree_name: Some("stoic-reed".into()),
+                            full_path: "/worktrees/stoic-reed/zed".into(),
+                            highlight_positions: Vec::new(),
+                            kind: WorktreeKind::Linked,
+                            branch_name: Some("stoic-reed".into()),
+                        }]),
+                ),
+            )
+            .child(section_label(
+                "Manually opened linked worktree (main_path resolves to original repo)",
+            ))
+            .child(
+                container().child(
+                    ThreadItem::new("ti-manual-linked", "Robust Git Worktree Rollback")
+                        .icon(IconName::ZedAgent)
+                        .timestamp("40m")
+                        .worktrees(vec![ThreadItemWorktreeInfo {
+                            worktree_name: Some("focal-arrow".into()),
+                            full_path: "/worktrees/focal-arrow/zed".into(),
+                            highlight_positions: Vec::new(),
+                            kind: WorktreeKind::Linked,
+                            branch_name: Some("persist-worktree-3-wiring".into()),
+                        }]),
+                ),
+            )
+            .child(section_label(
+                "Linked worktree + branch + diff stats + timestamp",
+            ))
+            .child(
+                container().child(
+                    ThreadItem::new("ti-linked-full", "Full metadata with diff stats")
+                        .icon(IconName::AiClaude)
+                        .timestamp("3w")
+                        .added(42)
+                        .removed(17)
+                        .worktrees(vec![ThreadItemWorktreeInfo {
+                            worktree_name: Some("jade-glen".into()),
+                            full_path: "/worktrees/jade-glen/zed".into(),
+                            highlight_positions: Vec::new(),
+                            kind: WorktreeKind::Linked,
+                            branch_name: Some("feature-branch".into()),
+                        }]),
+                ),
+            )
+            .child(section_label("Long branch name truncation with diff stats"))
+            .child(
+                container().child(
+                    ThreadItem::new("ti-long-branch", "Overflow test with very long branch")
+                        .icon(IconName::AiClaude)
+                        .timestamp("2d")
+                        .added(108)
+                        .removed(53)
+                        .worktrees(vec![ThreadItemWorktreeInfo {
+                            worktree_name: Some("my-project".into()),
+                            full_path: "/worktrees/my-project/zed".into(),
+                            highlight_positions: Vec::new(),
+                            kind: WorktreeKind::Linked,
+                            branch_name: Some(
+                                "fix-very-long-branch-name-that-should-truncate".into(),
+                            ),
+                        }]),
+                ),
+            )
+            .child(section_label(
+                "Main worktree with branch + diff stats + timestamp (branch hidden)",
+            ))
+            .child(
+                container().child(
+                    ThreadItem::new("ti-main-full", "Main worktree with everything")
+                        .icon(IconName::ZedAgent)
+                        .timestamp("5m")
+                        .added(23)
+                        .removed(8)
+                        .worktrees(vec![ThreadItemWorktreeInfo {
+                            worktree_name: Some("zed".into()),
+                            full_path: "/projects/zed".into(),
+                            highlight_positions: Vec::new(),
+                            kind: WorktreeKind::Main,
+                            branch_name: Some("sidebar-show-branch-name".into()),
+                        }]),
+                ),
+            )
     }
 }
