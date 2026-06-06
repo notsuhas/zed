@@ -593,6 +593,39 @@ impl PullRequestPanel {
         self.composer_target = Some(target);
         let handle = self.comment_editor.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
+        // Lazily fetch mentionable users for the @-picker.
+        if self.repo_users.is_empty() {
+            if let (Some(provider), Some(owner), Some(repo)) =
+                (self.provider.clone(), self.owner.clone(), self.repo.clone())
+            {
+                cx.spawn(async move |this, cx| {
+                    let users = provider
+                        .fetch_assignable_users(&owner, &repo)
+                        .await
+                        .unwrap_or_default();
+                    this.update(cx, |this, cx| {
+                        this.repo_users = users;
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Insert an @-mention for `login` at the end of the composer text.
+    fn insert_mention(&mut self, login: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.comment_editor.read(cx).text(cx);
+        let separator = if current.is_empty() || current.ends_with(' ') {
+            ""
+        } else {
+            " "
+        };
+        let new_text = format!("{current}{separator}@{login} ");
+        self.comment_editor
+            .update(cx, |editor, cx| editor.set_text(new_text, window, cx));
         cx.notify();
     }
 
@@ -2433,10 +2466,28 @@ impl PullRequestPanel {
     /// The shared comment composer (editor + submit/cancel), used for replies
     /// and new threads.
     fn render_composer(&self, cx: &Context<Self>) -> impl IntoElement {
+        let mentions = (!self.repo_users.is_empty()).then(|| {
+            h_flex()
+                .gap_1()
+                .flex_wrap()
+                .children(self.repo_users.iter().take(12).map(|user| {
+                    let login = user.name.clone();
+                    Button::new(
+                        SharedString::from(format!("mention:{login}")),
+                        format!("@{login}"),
+                    )
+                    .label_size(LabelSize::XSmall)
+                    .style(ButtonStyle::Subtle)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.insert_mention(login.clone(), window, cx)
+                    }))
+                }))
+        });
         v_flex()
             .gap_1()
             .p_1()
             .child(self.comment_editor.clone())
+            .when_some(mentions, |this, mentions| this.child(mentions))
             .child(
                 h_flex()
                     .gap_1()
