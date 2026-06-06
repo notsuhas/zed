@@ -845,6 +845,7 @@ impl PullRequestPanel {
         let head_ref = info.head_ref.to_string();
         let project = self.project.clone();
         let workspace = self.workspace.clone();
+        let languages = self.project.read(cx).languages().clone();
         // Threads on this file, shown inline in the diff.
         let file_threads: Vec<ReviewThread> = loaded
             .threads
@@ -903,9 +904,17 @@ impl PullRequestPanel {
                 .await
                 .unwrap_or(None)
                 .unwrap_or_default();
+            let language = languages
+                .load_language_for_file_path(std::path::Path::new(path.as_ref()))
+                .await
+                .ok();
             workspace
                 .update_in(cx, |workspace, window, cx| {
-                    let head_buffer = cx.new(|cx| Buffer::local(head.to_string(), cx));
+                    let head_buffer = cx.new(|cx| {
+                        let mut buffer = Buffer::local(head.to_string(), cx);
+                        buffer.set_language(language.clone(), cx);
+                        buffer
+                    });
                     open_diff_item(
                         head_buffer,
                         base.as_ref(),
